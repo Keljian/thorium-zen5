@@ -134,13 +134,20 @@ function ConvertTo-Win32ArgumentString {
 }
 
 function Invoke-Logged {
-    <# Run an external command, streaming + logging output, failing loudly on non-zero exit. #>
+    <#
+    Run an external command, streaming its output line-by-line to the
+    console and log file AS IT ARRIVES (not buffered until exit), and
+    printing a periodic "still running" heartbeat with elapsed time so a
+    long, quiet step (fetch, gclient sync, a link step) doesn't look hung.
+    Fails loudly on a disallowed exit code.
+    #>
     param(
         [Parameter(Mandatory)][string]$Exe,
         [Parameter(Mandatory)][string[]]$Arguments,
         [string]$WorkingDirectory = $null,
         [hashtable]$EnvVars = $null,
-        [int[]]$AllowedExitCodes = @(0)
+        [int[]]$AllowedExitCodes = @(0),
+        [int]$HeartbeatSeconds = 30   # 0 disables the heartbeat line
     )
     Write-Log "RUN: $Exe $($Arguments -join ' ')"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
@@ -149,6 +156,7 @@ function Invoke-Logged {
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
     if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
     if ($EnvVars) { foreach ($k in $EnvVars.Keys) { $psi.Environment[$k] = $EnvVars[$k] } }
 
@@ -158,22 +166,59 @@ function Invoke-Logged {
     } catch {
         throw "Failed to start '$Exe' (is it installed and on PATH? full path expected): $_"
     }
-    $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
-    $stderrTask = $proc.StandardError.ReadToEndAsync()
+
+    # Rolling tail kept only for the failure report; full output already
+    # went to the log file as it streamed.
+    $tail = New-Object System.Collections.Generic.List[string]
+    function Add-TailLine([string]$line) {
+        Write-Host $line
+        Add-Content -Path $script:LogFile -Value $line
+        $tail.Add($line)
+        if ($tail.Count -gt 200) { $tail.RemoveAt(0) }
+    }
+
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $lastBeat = [TimeSpan]::Zero
+    $outTask = $proc.StandardOutput.ReadLineAsync()
+    $errTask = $proc.StandardError.ReadLineAsync()
+
+    while ($null -ne $outTask -or $null -ne $errTask) {
+        [System.Threading.Tasks.Task[]]$pending = @($outTask, $errTask) | Where-Object { $null -ne $_ }
+        [System.Threading.Tasks.Task]::WaitAny($pending, 500) | Out-Null
+
+        if ($null -ne $outTask -and $outTask.IsCompleted) {
+            $line = $outTask.Result
+            if ($null -ne $line) { Add-TailLine $line; $outTask = $proc.StandardOutput.ReadLineAsync() }
+            else { $outTask = $null }
+        }
+        if ($null -ne $errTask -and $errTask.IsCompleted) {
+            $line = $errTask.Result
+            if ($null -ne $line) { Add-TailLine $line; $errTask = $proc.StandardError.ReadLineAsync() }
+            else { $errTask = $null }
+        }
+
+        if ($HeartbeatSeconds -gt 0 -and ($sw.Elapsed - $lastBeat).TotalSeconds -ge $HeartbeatSeconds) {
+            $lastBeat = $sw.Elapsed
+            Write-Log ("... still running ({0:hh\:mm\:ss} elapsed): $Exe" -f $sw.Elapsed)
+        }
+    }
     $proc.WaitForExit()
-    $stdout = $stdoutTask.Result
-    $stderr = $stderrTask.Result
-    if ($stdout) { Add-Content -Path $script:LogFile -Value $stdout }
-    if ($stderr) { Add-Content -Path $script:LogFile -Value $stderr }
+    $sw.Stop()
 
     if ($AllowedExitCodes -notcontains $proc.ExitCode) {
-        Write-Log "FAILED (exit $($proc.ExitCode)): $Exe $($Arguments -join ' ')" "ERROR"
-        Write-Log "--- last 60 lines of output ---" "ERROR"
-        $tail = ($stdout + "`n" + $stderr) -split "`n" | Select-Object -Last 60
+        Write-Log "FAILED (exit $($proc.ExitCode)) after $($sw.Elapsed.ToString('hh\:mm\:ss')): $Exe $($Arguments -join ' ')" "ERROR"
+        Write-Log "--- last $($tail.Count) lines of output ---" "ERROR"
         $tail | ForEach-Object { Write-Log $_ "ERROR" }
         throw "Command failed (exit $($proc.ExitCode)): $Exe $($Arguments -join ' '). See $script:LogFile"
     }
-    return $stdout
+    Write-Log "Done in $($sw.Elapsed.ToString('hh\:mm\:ss')): $Exe"
+    # No return value: every call site invokes this as a bare statement, and
+    # PowerShell auto-echoes an unconsumed return value to the console --
+    # returning the tail here would print it a second time after it already
+    # streamed live above. Nothing currently needs the captured text; if a
+    # future caller does, capture it via `$script:LastCommandTail` instead of
+    # widening this into a return value every other call site must suppress.
+    $script:LastCommandTail = ($tail -join "`n")
 }
 
 function Get-JobCount {
