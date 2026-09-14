@@ -53,7 +53,16 @@ param(
     [switch]$TrainPgo,                   # opt-in: attempt a local PGO retrain instead of Google's generic profile (NOT implemented by default -- see docs/BUILD.md)
     [switch]$SkipTests,
     [string]$SpeedometerDir = $null,
-    [switch]$Force
+    [switch]$Force,
+
+    # Priority class for every child process the build spawns. Defaults to
+    # BelowNormal so a multi-hour build leaves the machine usable: the build
+    # still gets all 32 threads and every idle cycle, but any foreground work
+    # preempts it instantly. Expect CPU to still read ~100% -- that is correct
+    # and harmless; it means no core is idling. Use Idle if you want the build
+    # to yield even harder, or Normal for the old behaviour.
+    [ValidateSet("Idle", "BelowNormal", "Normal")]
+    [string]$Priority = "BelowNormal"
 )
 
 $ErrorActionPreference = "Stop"
@@ -77,17 +86,69 @@ New-Item -ItemType Directory -Force -Path $BuildDir, $LogsDir, $ReleasesDir | Ou
 # ---------------------------------------------------------------------------
 # Logging (every major operation logs to build/logs/<command>.log, timestamped)
 # ---------------------------------------------------------------------------
+function Open-LogFile([string]$Path) {
+    <#
+    Hold ONE StreamWriter open for the life of a step instead of reopening the
+    file per line.
+
+    The previous implementation called Add-Content for every line. Across a
+    72,670-edge Chromium build that is a file open/close per line, and any
+    concurrent reader -- someone running `Get-Content -Wait` on the log, or a
+    monitoring tool -- causes a sharing violation. Because this script runs with
+    $ErrorActionPreference = "Stop", that trivial logging failure became a
+    TERMINATING error and killed the build outright:
+
+        Add-Content : The process cannot access the file
+        'C:\thorium\build\logs\build.log' because it is being used by another
+        process.
+
+    FileShare.ReadWrite lets others read (and tail) the log while we write, and
+    every write below is wrapped so that a logging problem can never again take
+    down a multi-hour build.
+    #>
+    Close-LogFile
+    $script:LogFile = $Path
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $fs = New-Object System.IO.FileStream(
+            $Path,
+            [System.IO.FileMode]::Append,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::ReadWrite)
+        $script:LogWriter = New-Object System.IO.StreamWriter($fs)
+        $script:LogWriter.AutoFlush = $true
+    } catch {
+        $script:LogWriter = $null
+        Write-Host "WARNING: could not open log file '$Path' ($($_.Exception.Message)). Continuing with console output only."
+    }
+}
+
+function Close-LogFile {
+    if ($script:LogWriter) {
+        try { $script:LogWriter.Flush(); $script:LogWriter.Dispose() } catch { }
+        $script:LogWriter = $null
+    }
+}
+
+function Write-LogLine([string]$line) {
+    # Best-effort by design: logging must never terminate the build.
+    if ($script:LogWriter) {
+        try { $script:LogWriter.WriteLine($line) } catch { }
+    }
+}
+
 function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts] [$Level] $Message"
     Write-Host $line
-    Add-Content -Path $script:LogFile -Value $line
+    Write-LogLine $line
 }
 
 function Start-Log([string]$Name) {
-    $script:LogFile = Join-Path $LogsDir "$Name.log"
-    Add-Content -Path $script:LogFile -Value ("=" * 78)
+    Open-LogFile (Join-Path $LogsDir "$Name.log")
+    Write-LogLine ("=" * 78)
     Write-Log "Starting '$Name' (profile=$Profile)"
 }
 
@@ -172,12 +233,24 @@ function Invoke-Logged {
         throw "Failed to start '$Exe' (is it installed and on PATH? full path expected): $_"
     }
 
+    # Set the priority class on the child we just started. Windows gives a new
+    # process its parent's class at creation, so lowering the build driver
+    # (siso/ninja/autoninja) automatically covers the hundreds of clang-cl
+    # processes it goes on to spawn -- no need to chase them individually.
+    if ($Priority -ne "Normal") {
+        try {
+            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::$Priority
+        } catch {
+            Write-Log "Could not set process priority to $Priority for '$Exe': $($_.Exception.Message)" "WARN"
+        }
+    }
+
     # Rolling tail kept only for the failure report; full output already
     # went to the log file as it streamed.
     $tail = New-Object System.Collections.Generic.List[string]
     function Add-TailLine([string]$line) {
         Write-Host $line
-        Add-Content -Path $script:LogFile -Value $line
+        Write-LogLine $line
         $tail.Add($line)
         if ($tail.Count -gt 200) { $tail.RemoveAt(0) }
     }
@@ -784,7 +857,7 @@ function Invoke-Configure {
     # Invoke-Audit calls Start-Log "audit", which repoints $script:LogFile --
     # so re-point it back afterwards or "Configure complete" lands in audit.log.
     Invoke-Audit
-    $script:LogFile = Join-Path $LogsDir "configure.log"
+    Open-LogFile (Join-Path $LogsDir "configure.log")
 
     # The zen5 profile is only meaningful if the pinned clang actually knows
     # -march=znver5. audit_build.py probes for this; fail loudly here rather
@@ -1060,6 +1133,7 @@ function Invoke-All {
 }
 
 # ---------------------------------------------------------------------------
+try {
 switch ($Command) {
     "audit"     { Invoke-Audit }
     "sync"      { Invoke-Sync }
@@ -1071,4 +1145,7 @@ switch ($Command) {
     "package"   { Invoke-Package }
     "installer" { Invoke-Installer }
     "all"       { Invoke-All }
+}
+} finally {
+    Close-LogFile
 }

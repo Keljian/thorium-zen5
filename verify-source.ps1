@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Verifies the state of the Thorium Zen5 source tree matches expectations
+    Verifies the state of the stock-Chromium source tree matches expectations
     before trusting a build: git integrity, the zen5 patches are actually
     applied, no unexpected modifications beyond what's tracked, and the
     configured GN args/compiler target/AVX-512 flags are what we intend.
@@ -30,7 +30,6 @@ param(
 $ErrorActionPreference = "Stop"
 $RepoRoot   = $PSScriptRoot
 $SrcDir     = Join-Path $RepoRoot "src"
-$ThoriumMeta = Join-Path $RepoRoot "upstream\Thorium"
 $BuildDir   = Join-Path $RepoRoot "build"
 New-Item -ItemType Directory -Force -Path $BuildDir | Out-Null
 
@@ -91,64 +90,56 @@ if (Test-Path (Join-Path $SrcDir ".git")) {
     Add-Warn "No Chromium checkout at $SrcDir yet -- skipping source-tree checks (run build.ps1 sync first)."
 }
 
-# 2. Expected upstream revision (Thorium meta-repo)
-if (Test-Path (Join-Path $ThoriumMeta ".git")) {
-    $upRev = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $ThoriumMeta, "rev-parse", "HEAD")
-    $result.upstream_revision = if ($upRev.ExitCode -eq 0) { $upRev.Output.Trim() } else { $null }
+# 2. Which Chromium are we pinned to?
+$tagFile = Join-Path $BuildDir "chromium-tag.txt"
+if (Test-Path $tagFile) {
+    $result.upstream_revision = (Get-Content $tagFile -Raw).Trim()
 } else {
-    Add-Warn "Thorium meta-repo not present at $ThoriumMeta."
+    Add-Warn "No build\chromium-tag.txt -- the checkout is not pinned to a known Chromium stable tag (run build.ps1 sync)."
 }
 
-# 3. Patches applied -- check patches/zen5 diffs are reflected in src, and
-#    that the zen5 declare_arg actually exists.
-$compilerOptGni = Join-Path $SrcDir "build\config\compiler_opt.gni"
+# 3. Are the zen5 patches applied? The marker apply_zen5_patches.py writes is
+#    the authority -- same string the patcher itself checks for idempotency.
+$patchedFile = Join-Path $SrcDir "build\config\compiler\BUILD.gn"
 $patchesApplied = $false
-if (Test-Path $compilerOptGni) {
-    $content = Get-Content $compilerOptGni -Raw
-    $patchesApplied = $content -match "use_znver5"
+if (Test-Path $patchedFile) {
+    $patchesApplied = (Select-String -Path $patchedFile -Pattern "thorium-zen5: Zen 5 CPU targeting" -Quiet)
     if (-not $patchesApplied) {
-        Add-Warn "use_znver5 not found in $compilerOptGni -- zen5 patches not applied yet (expected before first 'build.ps1 configure -Profile zen5|generic-avx512')."
+        Add-Warn "zen5 marker not found in $patchedFile -- patches not applied yet (expected before the first 'build.ps1 configure -Profile zen5')."
     }
 } else {
-    Add-Warn "$compilerOptGni not found -- source not synced/overlaid yet."
+    Add-Warn "$patchedFile not found -- source not synced yet."
 }
 $result.patches_applied = $patchesApplied
 
-# 4. No unexpected source modifications: diff the live src tree's Thorium-
-#    overlaid files against the Thorium meta-repo + our zen5 patches. Since
-#    Thorium's overlay is a straight file copy (not a git submodule), we
-#    compare file hashes for the non-patched files (should be byte-identical
-#    to the meta-repo) and rely on apply_zen5_patches.py's own marker check
-#    for the 4 files it modifies.
-$overlayDirs = @("ash","chrome","chromeos","components","content","extensions",
-                  "google_apis","media","net","sandbox","services","tools","ui")
-$zen5ModifiedFiles = @(
-    "build\config\compiler_opt.gni", "build\config\compiler\BUILD.gn",
-    "build\config\win\BUILD.gn", "v8\BUILD.gn"
-)
-if (Test-Path $SrcDir) {
-    foreach ($d in $overlayDirs) {
-        $metaPath = Join-Path $ThoriumMeta "src\$d"
-        $srcPath = Join-Path $SrcDir $d
-        if (-not (Test-Path $metaPath) -or -not (Test-Path $srcPath)) { continue }
-        $metaFiles = Get-ChildItem $metaPath -Recurse -File -ErrorAction SilentlyContinue
-        foreach ($mf in $metaFiles) {
-            $rel = $mf.FullName.Substring($metaPath.Length).TrimStart('\')
-            $target = Join-Path $srcPath $rel
-            if (-not (Test-Path $target)) {
-                $result.unexpected_changes += "Missing in src (present in Thorium overlay): $d\$rel"
-                continue
-            }
-            $h1 = (Get-FileHash $mf.FullName -Algorithm SHA256).Hash
-            $h2 = (Get-FileHash $target -Algorithm SHA256).Hash
-            if ($h1 -ne $h2) {
-                $result.unexpected_changes += "Content differs from Thorium overlay (unexpected local edit?): $d\$rel"
+# 4. No UNEXPECTED source modifications.
+#    On stock Chromium this is far stronger than the old overlay hash compare:
+#    src is a real git checkout, so git itself reports precisely which files
+#    differ from the pinned tag. Exactly one file should -- the one our patches
+#    edit. Anything else is an unexplained local modification and is surfaced.
+$expectedModified = @("build/config/compiler/BUILD.gn")
+if (Test-Path (Join-Path $SrcDir ".git")) {
+    $status = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "status", "--porcelain", "--untracked-files=no")
+    if ($status.ExitCode -ne 0) {
+        Add-Err "git status failed on the Chromium checkout: $($status.Output)"
+    } else {
+        foreach ($line in ($status.Output -split "`n")) {
+            $line = $line.Trim()
+            if (-not $line) { continue }
+            # porcelain format: XY <path>
+            $path = ($line -replace '^\S+\s+', '')
+            if ($expectedModified -notcontains $path) {
+                $result.unexpected_changes += $path
             }
         }
+        if ($result.unexpected_changes.Count -gt 0) {
+            foreach ($c in $result.unexpected_changes) {
+                Add-Err "Unexpected local modification in the Chromium checkout: $c (only $($expectedModified -join ', ') should differ from the pinned tag)"
+            }
+        } else {
+            Write-Host "OK: only the expected file(s) differ from the pinned Chromium tag." -ForegroundColor Green
+        }
     }
-}
-if ($result.unexpected_changes.Count -gt 0) {
-    foreach ($c in $result.unexpected_changes) { Add-Warn $c }
 }
 
 # 5. Expected compiler target / GN args / AVX-512 config for the requested profile
@@ -165,9 +156,9 @@ if (Test-Path $argsGnPath) {
     $result.target_cpu = $flags["target_cpu"]
 
     $expectations = switch ($Profile) {
-        "zen5"           { @{ use_avx512 = "true"; use_znver5 = "true"; target_cpu = '"x64"' } }
-        "generic-avx512" { @{ use_avx512 = "true"; use_znver5 = $null; target_cpu = '"x64"' } }
-        "baseline"       { @{ use_avx512 = "false"; use_znver5 = $null; target_cpu = '"x64"' } }
+        "zen5"           { @{ use_znver5 = "true";  use_generic_avx512 = "false"; target_cpu = '"x64"' } }
+        "generic-avx512" { @{ use_znver5 = "false"; use_generic_avx512 = "true";  target_cpu = '"x64"' } }
+        "baseline"       { @{ use_znver5 = "false"; use_generic_avx512 = "false"; target_cpu = '"x64"' } }
     }
     foreach ($k in $expectations.Keys) {
         $expected = $expectations[$k]

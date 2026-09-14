@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Automated upstream update pipeline for Thorium Zen5.
+    Automated upstream update pipeline: rebuild when Chromium stable moves.
 
 .DESCRIPTION
     upstream update detected -> fetch source -> rebase patches -> configure
@@ -14,7 +14,7 @@
     per docs/UPDATES.md.
 
 .PARAMETER CheckOnly
-    Only check for new Thorium/Chromium revisions; do not fetch or build.
+    Only check whether a newer Chromium stable exists; do not fetch or build.
     Useful for Windows Task Scheduler polling (see docs/UPDATES.md).
 
 .PARAMETER Profile
@@ -33,7 +33,6 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = $PSScriptRoot
-$ThoriumMeta = Join-Path $RepoRoot "upstream\Thorium"
 $SrcDir = Join-Path $RepoRoot "src"
 $BuildDir = Join-Path $RepoRoot "build"
 $LogsDir = Join-Path $BuildDir "logs"
@@ -43,92 +42,69 @@ $LogFile = Join-Path $LogsDir "update.log"
 function Log([string]$m, [string]$lvl = "INFO") {
     $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$lvl] $m"
     Write-Host $line
-    Add-Content -Path $LogFile -Value $line
+    # Best-effort: a locked log file must not abort the pipeline. build.ps1 was
+    # killed mid-build exactly this way (sharing violation on Add-Content under
+    # $ErrorActionPreference = "Stop").
+    try { Add-Content -Path $LogFile -Value $line -ErrorAction Stop } catch { }
 }
 
 Log "=== update.ps1 starting (profile=$Profile, CheckOnly=$CheckOnly) ==="
 
-function Resolve-ThoriumLatestStableTag {
-    # Kept in sync with the identical function in build.ps1 -- see the long
-    # comment there for why we track the latest stable RELEASE TAG and not the
-    # `main` branch (main goes stale for months while per-version branches ship).
-    $uri = "https://api.github.com/repos/Alex313031/Thorium/releases/latest"
+function Resolve-ChromiumStableTag {
+    # Kept in sync with the identical function in build.ps1 -- see the comment
+    # there for why this project tracks the current Chromium STABLE release
+    # rather than trunk, and no longer tracks Thorium at all.
+    $uri = "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=1"
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers @{ "User-Agent" = "thorium-zen5-update.ps1" } -UseBasicParsing
     } catch {
-        throw "Failed to resolve Thorium's latest stable release from $uri -- check network / GitHub rate limits: $_"
+        throw "Failed to resolve the current Chromium stable version from $uri -- check network access: $_"
     }
-    if (-not $resp.tag_name) { throw "GitHub releases/latest returned no tag_name for Alex313031/Thorium." }
-    return [string]$resp.tag_name
+    $version = @($resp)[0].version
+    if (-not $version) { throw "chromiumdash returned no 'version' for channel=Stable platform=Windows." }
+    if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "chromiumdash returned a non-version string: '$version'" }
+    return [string]$version
 }
 
-# 1. Detect new Thorium version.
-#    build.ps1 sync checks the meta-repo out at a release TAG (detached HEAD,
-#    shallow) and records it in build/thorium-tag.txt. So the meaningful
-#    comparison is "tag we last synced" vs "latest stable tag upstream" --
-#    NOT HEAD vs origin/main, which on a `--depth 1 --branch <tag>` clone has
-#    no origin/main ref to resolve at all.
-if (-not (Test-Path (Join-Path $ThoriumMeta ".git"))) {
-    throw "Thorium meta-repo not found at $ThoriumMeta. Run '.\build.ps1 sync' at least once first."
+# 1. Is there a newer Chromium stable release than the one we last synced?
+#    build.ps1 sync pins the checkout to a Chromium stable tag and records it
+#    in build/chromium-tag.txt, so that file vs chromiumdash IS the update
+#    check. This is a cheap HTTP call -- we never fetch ~30GB just to poll.
+if (-not (Test-Path $SrcDir)) {
+    throw "No Chromium checkout at $SrcDir. Run '.\build.ps1 sync' at least once first."
 }
-$tagMarkerFile = Join-Path $BuildDir "thorium-tag.txt"
-$localTag = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
-$latestTag = Resolve-ThoriumLatestStableTag
-$thoriumChanged = ($localTag -ne $latestTag)
-Log "Thorium meta-repo: synced-tag=$localTag latest-stable-tag=$latestTag changed=$thoriumChanged"
+$tagMarkerFile = Join-Path $BuildDir "chromium-tag.txt"
+$localTag  = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
+$latestTag = Resolve-ChromiumStableTag
+$chromiumChanged = ($localTag -ne $latestTag)
+Log "Chromium: synced=$localTag  latest-stable=$latestTag  changed=$chromiumChanged"
 
-# 2. Detect Chromium version changes (compare src/chrome/VERSION to what's recorded
-#    in the last build manifest, if any -- a lightweight local check that does not
-#    require fetching Chromium just to poll).
-$chromiumChanged = $true
+# 2. Have we ever produced a build for this profile? If not, treat as changed
+#    so a first run does something useful rather than reporting "up to date".
 $lastManifest = Join-Path $BuildDir "build-manifest-$Profile.json"
-if ((Test-Path $lastManifest) -and (Test-Path (Join-Path $SrcDir "chrome\VERSION"))) {
-    $lastCommit = (Get-Content $lastManifest -Raw | ConvertFrom-Json).source_revisions.chromium_src_commit
-    $ErrorActionPreference = "Continue"   # native stderr must not be terminating here
-    $currentCommit = (& git -C $SrcDir rev-parse origin/main 2>$null | Select-Object -First 1)
-    $ErrorActionPreference = "Stop"
-    $chromiumChanged = ($lastCommit -ne $currentCommit)
-    # Honest about what this does and doesn't tell us: origin/main here is
-    # whatever the LAST sync fetched, not live upstream (we deliberately don't
-    # fetch ~30GB just to poll). So this detects "we built older than what we
-    # already have on disk"; genuinely new upstream Chromium arrives via the
-    # Thorium tag bump above, which is what actually pins the Chromium version.
-    Log "Chromium: last-built=$lastCommit last-fetched-origin/main=$currentCommit changed=$chromiumChanged"
-} else {
+$neverBuilt = -not (Test-Path $lastManifest)
+if ($neverBuilt) {
     Log "No prior build-manifest for profile '$Profile' -- treating as changed (first build)."
 }
 
-# 3. Relevant Thorium build-system changes: did any of the files our zen5
-#    patches touch change shape upstream?
-#
-#    This used to `git diff $localRev $remoteRev -- <path>`, which cannot work
-#    now: the meta-repo is a --depth 1 tag checkout, so both revisions are not
-#    present locally to diff, and the pathspecs were written with backslashes
-#    which git does not match against its forward-slash index anyway -- so the
-#    check silently reported "no change" every time.
-#
-#    A tag bump is itself the signal that the patch targets may have moved.
-#    We don't guess: apply_zen5_patches.py verifies each insertion marker and
-#    fails loudly (exit 3) if one is gone, and stage 5 below treats that as a
-#    hard stop. So flag the risk, and let the patcher be the authority.
-$watchedFiles = @(
-    "src/build/config/compiler_opt.gni", "src/build/config/compiler/BUILD.gn",
-    "src/build/config/win/BUILD.gn", "src/v8/BUILD.gn"
-)
-$buildSystemChanged = $thoriumChanged
-if ($buildSystemChanged) {
-    Log "Thorium tag changed ($localTag -> $latestTag). The zen5 patches target these files upstream:" "WARN"
-    foreach ($f in $watchedFiles) { Log "    $f" "WARN" }
-    Log "  apply_zen5_patches.py re-verifies every insertion marker during configure and stops the pipeline if any moved." "WARN"
+# 3. A Chromium version bump is also the signal that our patch anchors may have
+#    moved. We do not try to predict that: apply_zen5_patches.py re-verifies
+#    every insertion anchor and exits 3 if one is missing or ambiguous, writing
+#    nothing, and the configure stage below treats that as a hard stop. So warn,
+#    and let the patcher be the authority.
+if ($chromiumChanged -and $localTag) {
+    Log "Chromium tag changing $localTag -> $latestTag. The zen5 patches anchor into build/config/compiler/BUILD.gn; apply_zen5_patches.py will verify those anchors and stop the pipeline if upstream moved them." "WARN"
 }
 
-if (-not ($thoriumChanged -or $chromiumChanged -or $buildSystemChanged)) {
-    Log "No upstream changes detected. Nothing to do."
+$updateAvailable = ($chromiumChanged -or $neverBuilt)
+
+if (-not $updateAvailable) {
+    Log "Already on Chromium stable $localTag with a completed build for profile '$Profile'. Nothing to do."
     exit 0
 }
 
 if ($CheckOnly) {
-    Log "CheckOnly: changes detected (thorium=$thoriumChanged chromium=$chromiumChanged build-system=$buildSystemChanged). Exiting without fetching/building."
+    Log "CheckOnly: update available (chromium: $localTag -> $latestTag, never-built=$neverBuilt). Exiting without fetching/building."
     exit 10   # distinct code: "update available" for Task Scheduler / scripts to key off of
 }
 
