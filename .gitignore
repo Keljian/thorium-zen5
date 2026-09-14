@@ -15,6 +15,7 @@
 # gclient's quarantine dir for dependencies whose SCM type doesn't match
 # what DEPS expects -- part of its own working state, not ours.
 /_bad_scm/
+/.gclient_previous_sync_commits
 
 # Generated build artifacts -- reproducible from build.ps1; keep directory
 # structure (via .gitkeep) but not contents.

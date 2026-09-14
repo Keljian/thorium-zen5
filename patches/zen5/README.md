@@ -1,57 +1,103 @@
-# patches/zen5 -- Zen 5 (znver5) compiler-targeting patches
+# Zen 5 patches
 
-These patches are **not** hand-authored `.patch` files checked in ahead of
-time. They are generated the first time you run
+What this project adds to a **stock Chromium** checkout to target AMD Zen 5
+(Ryzen 9 9950X). Applied by `scripts/apply_zen5_patches.py`, which
+`build.ps1 configure` runs for the `zen5` and `generic-avx512` profiles (the
+`baseline` profile is left completely unpatched on purpose).
 
-```powershell
-.\build.ps1 configure -Profile zen5
+## Why there is anything to add at all
+
+Stock Chromium does no x86 microarchitecture targeting. Verified directly
+against Chromium **154.0.8037.17**: `build/config/compiler/BUILD.gn` is 3259
+lines and contains exactly one `-march=` reference — `-march=$arm_arch`, for
+ARM. Every x86 build is a generic x86-64 baseline.
+
+So there is no upstream flag to flip and nothing to override. We add our own.
+
+> Historical note: until 2026-09-14 this project overlaid Thorium's sources,
+> and the patches here existed to *replace* Thorium's hardcoded
+> `-mllvm:-march=skylake-avx512`. That overlay was dropped — Thorium pinned
+> Chromium 138 against a stable of 154, and all its release tags pointed at a
+> single May 8 commit. See `docs/ARCHITECTURE.md`.
+
+## The two edits
+
+Both land in `build/config/compiler/BUILD.gn`.
+
+**1. `declare_args()`**, inserted immediately before `config("compiler")`:
+
+```gn
+declare_args() {
+  use_znver5 = false
+  use_generic_avx512 = false
+}
 ```
 
-against a real, synced source tree, by `scripts/apply_zen5_patches.py
---capture-diffs`. That script performs the edits (described below) against
-the actual checked-out files and then runs `git diff` to capture the exact
-result into this directory as `NNNN-<file>.patch`, plus a `MANIFEST.txt`.
+Both default to `false`, so a tree with the patch applied but neither arg set
+builds byte-for-byte stock. That is what makes the `baseline` comparison
+honest.
 
-Generating them this way -- rather than hand-typing unified diffs against
-files we have only seen through a terminal -- avoids the single biggest
-risk with maintaining Chromium patches: a line-offset or whitespace
-mismatch that makes `git apply` silently fail or, worse, apply to the wrong
-context. See `scripts/apply_zen5_patches.py`'s module docstring for exactly
-how it locates each edit site (via exact, distinctive compiler-flag string
-literals, not line numbers) and why that's robust to upstream reformatting.
+**2. A targeting block**, inserted inside `config("compiler")` right after its
+flag-list initialisers (`cflags = []` … `configs = []`):
 
-Once generated, the `.patch` files in this directory are the durable,
-reviewable record of what Zen5-profile changes were made -- commit them to
-git normally. `update.ps1` re-runs `apply_zen5_patches.py` against each new
-upstream sync; if a marker is no longer found (upstream changed the file's
-shape), the script **stops with a non-zero exit code and does not guess**,
-per the project's "detect patch conflicts, stop rather than silently
-resolve incorrectly" requirement. When that happens, re-derive the new
-marker/insertion point from the real updated file (see
-`docs/ARCHITECTURE.md`) and update `scripts/apply_zen5_patches.py` by hand.
+```gn
+if (is_win && current_cpu == "x64" && is_clang && is_a_target_toolchain) {
+  assert(!(use_znver5 && use_generic_avx512), ...)
+  if (use_znver5) {
+    cflags += [ "-march=znver5", "-mtune=znver5" ]
+  } else if (use_generic_avx512) {
+    cflags += [ "-march=skylake-avx512", "-mtune=skylake-avx512" ]
+  }
+}
+```
 
-## What each edit does
+The `is_a_target_toolchain` guard matters: without it the host toolchain
+inherits the flags, and build tools that must run on the build machine (and
+on other architectures) would be compiled for Zen 5.
 
-| # | Upstream file | Purpose | Reason | Expected effect | Reversible? |
-|---|---|---|---|---|---|
-| 1 | `build/config/compiler_opt.gni` | Add a new `use_znver5` GN arg (default `false`) plus two sanity `assert()`s. | Thorium has no per-microarchitecture targeting arg at all -- only coarse SIMD-level flags (`use_avx2`, `use_avx512`, ...). We need a flag to opt into Zen5-specific codegen without disturbing any stock Thorium build (baseline, AVX2, generic-avx512 all keep working unmodified). | New arg is inert unless explicitly set `true` in `gn/win_zen5_args.gn`. | Fully reversible: delete the 6 added lines + trailing assert block, or simply never set `use_znver5 = true`. |
-| 2 | `build/config/compiler/BUILD.gn` (Windows x64 branch) | Where stock Thorium would set `-mllvm:-march=haswell` (AVX2) or `-mllvm:-march=skylake-avx512` (AVX-512) as the ThinLTO backend's codegen/scheduling target, insert an `if (use_znver5) { ... } else` branch ahead of it that instead emits `/clang:-march=znver5 /clang:-mtune=znver5` (compile) and `-mllvm:-march=znver5` (ThinLTO backend). | This hardcoded `skylake-avx512` is the exact "generic AVX-512 treated as final target" problem: it caps codegen/scheduling to Skylake-X's model and instruction set, never touching Zen5-only ISA (VNNI, VBMI, VBMI2, BITALG, VPOPCNTDQ, IFMA, BF16, GFNI, VAES, VPCLMULQDQ). `-march=znver5` lets Clang select the complete, correct set itself. | Every TU compiled for the main `chrome`/`thorium` target (and everything ThinLTO-optimized at link time) is scheduled and vectorized for Zen 5 instead of Skylake-X. | Fully reversible: each inserted `if (use_znver5) {...} else` can be deleted, restoring the original unconditional `if (use_avx2)` / `if (use_avx512)` block verbatim. |
-| 3 | `build/config/compiler/BUILD.gn` (Linux/Mac x64 branch) | Same transformation, mirrored for the non-Windows branch. | Not exercised by this Windows-only project, but keeps the source tree self-consistent (a future Linux zen5 profile would just need `use_znver5=true` in a Linux args.gn, no further patching). | No effect on the Windows build. | Same as above. |
-| 4 | `build/config/win/BUILD.gn` (cflags block) | Insert the same `if (use_znver5) {...} else` ahead of the AVX-512 `cflags` array (this block previously had **no march= at all**, only individual `-mavx512*` feature flags). | Ensures the `cl.exe`-wrapper compile path (distinct from block above) also gets full Zen5 targeting, not just the ThinLTO linker backend. | Consistent codegen between the compile and link stages. | Fully reversible. |
-| 5 | `build/config/win/BUILD.gn` (release ldflags block) | Same transformation for the second, separate `ldflags` block that sets the ThinLTO backend `-march` specifically for non-debug/non-component release builds. | This is the actual block that ships in `is_official_build=true` release configuration -- the one that matters for a real installer build. | Release build's ThinLTO backend targets Zen 5. | Fully reversible. |
-| 6 | `v8/BUILD.gn` (Windows path) | Same transformation for V8's own, separately-declared AVX-512 `cflags`. | V8 (the JS engine) is compiled as mostly-separate GN targets with their own flag handling; without this edit V8's own object code would stay on the generic AVX-512 feature list even though the rest of the browser is Zen5-tuned. | V8 builtins/interpreter/Torque-generated code also compiled for Zen 5. | Fully reversible. |
-| 7 | `v8/BUILD.gn` (non-Windows path) | Same transformation, mirrored. | Consistency; unused on Windows. | None on this project. | Fully reversible. |
+`-march=znver5` lets Clang's own CPU model select the complete instruction
+set — AVX512VNNI, VBMI, VBMI2, BITALG, VPOPCNTDQ, IFMA, BF16, GFNI, VAES,
+VPCLMULQDQ — plus Zen 5 scheduling. That is deliberately *not* a
+hand-maintained feature list: a hand-maintained list goes stale and silently
+under-targets.
+
+## Why no ThinLTO backend flag
+
+We set compile flags only — no `-mllvm:-march=` / `-Wl,-mllvm,-march=`.
+
+Clang encodes `target-cpu` and `target-features` into the emitted bitcode as
+per-function attributes, and the ThinLTO backend honours them during codegen.
+A backend override is therefore not obviously required, and which spelling
+LLVM's LTO actually accepts (`-mcpu=` vs `-march=`) varies by version — a
+wrong guess is silently ignored or rejected rather than loudly wrong.
+
+This is left as a **measured** question, not an assumed one:
+`scripts/analyze_isa.py` disassembles the built binary and counts real
+AVX-512 instructions per ISA extension. If a `zen5` build shows no more
+AVX-512 than `baseline`, that is the evidence to come back and add a backend
+flag with — see `docs/BENCHMARKS.md`.
+
+## Robustness
+
+`apply_zen5_patches.py` is anchored on exact text, not line numbers, and each
+anchor must match **exactly once**. On any other count it prints the anchor,
+writes nothing at all, and exits **3** — which `build.ps1 configure` treats as
+a hard stop, so no build is ever attempted from a half-patched tree. It is
+idempotent: a marker string is checked first, so re-running is a no-op.
+
+It also verifies brace balance is unchanged before writing.
 
 ## Regenerating after upstream changes
 
-`update.ps1` calls:
+If Chromium restructures `config("compiler")`, the patcher will exit 3 and
+name the anchor that no longer matches. To fix:
 
-```
-python3 scripts/apply_zen5_patches.py --src-dir <src> --capture-diffs
-```
+1. Open `src/build/config/compiler/BUILD.gn` at the current pinned tag.
+2. Find the equivalent location (the `config("compiler")` declaration, and its
+   `cflags`/`ldflags`/`configs` initialiser block).
+3. Update `anchor1` / `anchor2` in `scripts/apply_zen5_patches.py`.
+4. Re-run `build.ps1 configure -Profile zen5 -Force` and confirm the captured
+   diff in this directory still shows only the two intended insertions.
 
-If every marker is still found, new `.patch` files are written here
-(overwriting the previous ones) and the pipeline continues. If any marker
-is missing, the script exits 3 and `update.ps1` stops the whole pipeline
-immediately -- no build, no test, no release is produced from a tree where
-the Zen5 patches didn't actually apply.
+The captured diff of the last successful application is committed here as
+`build_config_compiler_BUILD.gn.diff`.
