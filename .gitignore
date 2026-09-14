@@ -5,6 +5,12 @@
 /.gclient
 /.gclient_entries
 /.cipd/
+# depot_tools' fetch.bat creates a randomly-named scratch dir at the repo
+# root while cloning (e.g. _gclient_src_6i6m77dp/), then renames it to
+# src/ on success -- never left behind after a clean fetch, but visible
+# (and easy to `git add .` by accident) while a fetch is in progress or if
+# one was interrupted.
+/_gclient_*/
 
 # Generated build artifacts -- reproducible from build.ps1; keep directory
 # structure (via .gitkeep) but not contents.
