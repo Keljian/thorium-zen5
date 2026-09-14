@@ -86,26 +86,78 @@ function Start-Log([string]$Name) {
     Write-Log "Starting '$Name' (profile=$Profile)"
 }
 
+function ConvertTo-Win32ArgumentString {
+    <#
+    Builds a single Win32-CreateProcess-compatible argument string from a
+    list of raw arguments, using the standard MSVCRT/CommandLineToArgvW
+    escaping rules (backslashes before a literal quote are doubled, and
+    the quote itself is backslash-escaped; a trailing run of backslashes
+    right before the closing quote is doubled).
+
+    We build this by hand instead of using ProcessStartInfo.ArgumentList
+    because that property is NOT lazily initialized under Windows
+    PowerShell 5.1's .NET Framework (unlike .NET Core/5+) -- it is $null
+    until explicitly assigned, and Windows PowerShell has no public setter
+    for it, so calling .Add() on a fresh ProcessStartInfo throws
+    "You cannot call a method on a null-valued expression." Building the
+    legacy .Arguments string works identically on every PowerShell/.NET
+    version.
+    #>
+    param([string[]]$ArgumentList)
+    $parts = foreach ($rawArg in $ArgumentList) {
+        $arg = if ($null -eq $rawArg) { "" } else { $rawArg }
+        if ($arg -eq "" -or $arg -match '[\s"]') {
+            $sb = New-Object System.Text.StringBuilder
+            [void]$sb.Append('"')
+            $backslashes = 0
+            foreach ($ch in $arg.ToCharArray()) {
+                if ($ch -eq '\') {
+                    $backslashes++
+                } else {
+                    if ($ch -eq '"') {
+                        [void]$sb.Append('\' * (($backslashes * 2) + 1))
+                    } else {
+                        [void]$sb.Append('\' * $backslashes)
+                    }
+                    [void]$sb.Append($ch)
+                    $backslashes = 0
+                }
+            }
+            [void]$sb.Append('\' * ($backslashes * 2))
+            [void]$sb.Append('"')
+            $sb.ToString()
+        } else {
+            $arg
+        }
+    }
+    return ($parts -join ' ')
+}
+
 function Invoke-Logged {
     <# Run an external command, streaming + logging output, failing loudly on non-zero exit. #>
     param(
         [Parameter(Mandatory)][string]$Exe,
-        [Parameter(Mandatory)][string[]]$Args,
+        [Parameter(Mandatory)][string[]]$Arguments,
         [string]$WorkingDirectory = $null,
-        [hashtable]$Env = $null,
+        [hashtable]$EnvVars = $null,
         [int[]]$AllowedExitCodes = @(0)
     )
-    Write-Log "RUN: $Exe $($Args -join ' ')"
+    Write-Log "RUN: $Exe $($Arguments -join ' ')"
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $Exe
-    foreach ($a in $Args) { $psi.ArgumentList.Add($a) }
+    $psi.Arguments = ConvertTo-Win32ArgumentString -ArgumentList $Arguments
     $psi.RedirectStandardOutput = $true
     $psi.RedirectStandardError = $true
     $psi.UseShellExecute = $false
     if ($WorkingDirectory) { $psi.WorkingDirectory = $WorkingDirectory }
-    if ($Env) { foreach ($k in $Env.Keys) { $psi.Environment[$k] = $Env[$k] } }
+    if ($EnvVars) { foreach ($k in $EnvVars.Keys) { $psi.Environment[$k] = $EnvVars[$k] } }
 
-    $proc = [System.Diagnostics.Process]::Start($psi)
+    $proc = $null
+    try {
+        $proc = [System.Diagnostics.Process]::Start($psi)
+    } catch {
+        throw "Failed to start '$Exe' (is it installed and on PATH? full path expected): $_"
+    }
     $stdoutTask = $proc.StandardOutput.ReadToEndAsync()
     $stderrTask = $proc.StandardError.ReadToEndAsync()
     $proc.WaitForExit()
@@ -115,11 +167,11 @@ function Invoke-Logged {
     if ($stderr) { Add-Content -Path $script:LogFile -Value $stderr }
 
     if ($AllowedExitCodes -notcontains $proc.ExitCode) {
-        Write-Log "FAILED (exit $($proc.ExitCode)): $Exe $($Args -join ' ')" "ERROR"
+        Write-Log "FAILED (exit $($proc.ExitCode)): $Exe $($Arguments -join ' ')" "ERROR"
         Write-Log "--- last 60 lines of output ---" "ERROR"
         $tail = ($stdout + "`n" + $stderr) -split "`n" | Select-Object -Last 60
         $tail | ForEach-Object { Write-Log $_ "ERROR" }
-        throw "Command failed (exit $($proc.ExitCode)): $Exe $($Args -join ' '). See $script:LogFile"
+        throw "Command failed (exit $($proc.ExitCode)): $Exe $($Arguments -join ' '). See $script:LogFile"
     }
     return $stdout
 }
@@ -155,7 +207,7 @@ function Invoke-Audit {
     Start-Log "audit"
     $py = (Get-Command python -ErrorAction SilentlyContinue).Source
     if (-not $py) { $py = (Get-Command python3).Source }
-    Invoke-Logged -Exe $py -Args @((Join-Path $ScriptsDir "audit_build.py"), "--repo-root", $RepoRoot)
+    Invoke-Logged -Exe $py -Arguments @((Join-Path $ScriptsDir "audit_build.py"), "--repo-root", $RepoRoot)
     Write-Log "Audit written to $(Join-Path $BuildDir 'audit.json')"
 }
 
@@ -170,7 +222,7 @@ function Invoke-Sync {
     if (-not (Test-Path $SrcDir)) {
         Write-Log "No existing checkout at $SrcDir -- running 'fetch chromium'. This downloads ~20-30GB and can take hours depending on connection."
         New-Item -ItemType Directory -Force -Path $RepoRoot | Out-Null
-        Invoke-Logged -Exe (Join-Path $DepotTools "fetch.bat") -Args @("--nohooks", "chromium") -WorkingDirectory $RepoRoot -Env $env
+        Invoke-Logged -Exe (Join-Path $DepotTools "fetch.bat") -Arguments @("--nohooks", "chromium") -WorkingDirectory $RepoRoot -EnvVars $env
         Rename-Item -Path (Join-Path $RepoRoot "chromium") -NewName "chromium-fetch-tmp" -ErrorAction SilentlyContinue
         if (Test-Path (Join-Path $RepoRoot "chromium-fetch-tmp\src")) {
             Move-Item (Join-Path $RepoRoot "chromium-fetch-tmp\src") $SrcDir
@@ -179,24 +231,24 @@ function Invoke-Sync {
         }
     } else {
         Write-Log "Existing checkout found at $SrcDir -- updating."
-        Invoke-Logged -Exe "git" -Args @("checkout", "-f", "origin/main") -WorkingDirectory (Join-Path $SrcDir "v8") -Env $env
-        Invoke-Logged -Exe "git" -Args @("checkout", "-f", "origin/main") -WorkingDirectory $SrcDir -Env $env
-        Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Args @("fetch", "--tags") -WorkingDirectory $SrcDir -Env $env -AllowedExitCodes @(0,1)
+        Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "origin/main") -WorkingDirectory (Join-Path $SrcDir "v8") -EnvVars $env
+        Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "origin/main") -WorkingDirectory $SrcDir -EnvVars $env
+        Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Arguments @("fetch", "--tags") -WorkingDirectory $SrcDir -EnvVars $env -AllowedExitCodes @(0,1)
     }
 
     Write-Log "Running gclient sync -D (this pulls all deps: V8, WebRTC, ANGLE, etc. Long.)"
     Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") `
-        -Args @("sync", "--with_branch_heads", "--with_tags", "-f", "-R", "-D") `
-        -WorkingDirectory $SrcDir -Env $env
+        -Arguments @("sync", "--with_branch_heads", "--with_tags", "-f", "-R", "-D") `
+        -WorkingDirectory $SrcDir -EnvVars $env
 
     Write-Log "Running gclient runhooks (pulls pinned clang/Windows toolchain files)."
-    Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Args @("runhooks") -WorkingDirectory $SrcDir -Env $env
+    Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Arguments @("runhooks") -WorkingDirectory $SrcDir -EnvVars $env
 
     Write-Log "Pulling latest Thorium meta-repo."
     if (Test-Path (Join-Path $ThoriumMeta ".git")) {
-        Invoke-Logged -Exe "git" -Args @("pull", "--ff-only") -WorkingDirectory $ThoriumMeta
+        Invoke-Logged -Exe "git" -Arguments @("pull", "--ff-only") -WorkingDirectory $ThoriumMeta
     } else {
-        Invoke-Logged -Exe "git" -Args @("clone", "--depth", "1", "https://github.com/Alex313031/Thorium.git", $ThoriumMeta)
+        Invoke-Logged -Exe "git" -Arguments @("clone", "--depth", "1", "https://github.com/Alex313031/Thorium.git", $ThoriumMeta)
     }
 
     Write-Log "Sync complete."
@@ -281,7 +333,7 @@ function Invoke-SourceOverlay([string]$Flavor) {
 
         Write-Log "  applying zen5 patches (patches/zen5 -- see that directory's README.md)"
         $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
-        Invoke-Logged -Exe $py -Args @(
+        Invoke-Logged -Exe $py -Arguments @(
             (Join-Path $ScriptsDir "apply_zen5_patches.py"),
             "--src-dir", $SrcDir, "--capture-diffs", "--patches-dir", $PatchesDir
         )
@@ -298,14 +350,14 @@ function Get-OrDownloadPgoProfile {
 
     Write-Log "Downloading Chromium's official win64 PGO profile (generic, not Zen5-trained -- see docs/BUILD.md 'About PGO')."
     $env = Get-DepotToolsEnv
-    Invoke-Logged -Exe "python3" -Args @(
+    Invoke-Logged -Exe "python3" -Arguments @(
         "tools/update_pgo_profiles.py", "--target=win64", "update",
         "--gs-url-base=chromium-optimization-profiles/pgo_profiles"
-    ) -WorkingDirectory $SrcDir -Env $env
-    Invoke-Logged -Exe "python3" -Args @(
+    ) -WorkingDirectory $SrcDir -EnvVars $env
+    Invoke-Logged -Exe "python3" -Arguments @(
         "v8/tools/builtins-pgo/download_profiles.py",
         "--depot-tools=$DepotTools", "--force", "download"
-    ) -WorkingDirectory $SrcDir -Env $env
+    ) -WorkingDirectory $SrcDir -EnvVars $env
 
     $downloaded = Get-ChildItem $pgoDir -Filter "chrome-win64-*.profdata" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1
     if (-not $downloaded) { throw "PGO profile download did not produce a .profdata file in $pgoDir" }
@@ -345,7 +397,7 @@ function Invoke-Configure {
 
     $env = Get-DepotToolsEnv
     Write-Log "Running gn gen out\thorium-$Profile"
-    Invoke-Logged -Exe (Join-Path $DepotTools "gn.bat") -Args @("gen", "out\thorium-$Profile") -WorkingDirectory $SrcDir -Env $env
+    Invoke-Logged -Exe (Join-Path $DepotTools "gn.bat") -Arguments @("gen", "out\thorium-$Profile") -WorkingDirectory $SrcDir -EnvVars $env
 
     # Re-audit now that the tree is patched/configured, so build/audit.json
     # reflects what will actually be built, not just what was synced.
@@ -366,15 +418,15 @@ function Invoke-Build {
     Write-Log "Building profile '$Profile' with $jobs jobs (autoninja thorium_all + thorium_installer)."
 
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") `
-        -Args @("-C", "out\thorium-$Profile", "thorium_all", "-j$jobs") `
-        -WorkingDirectory $SrcDir -Env $env
+        -Arguments @("-C", "out\thorium-$Profile", "thorium_all", "-j$jobs") `
+        -WorkingDirectory $SrcDir -EnvVars $env
 
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") `
-        -Args @("-C", "out\thorium-$Profile", "thorium_installer", "-j$jobs") `
-        -WorkingDirectory $SrcDir -Env $env
+        -Arguments @("-C", "out\thorium-$Profile", "thorium_installer", "-j$jobs") `
+        -WorkingDirectory $SrcDir -EnvVars $env
 
     $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
-    Invoke-Logged -Exe $py -Args @(
+    Invoke-Logged -Exe $py -Arguments @(
         (Join-Path $ScriptsDir "generate_manifest.py"),
         "--repo-root", $RepoRoot, "--profile", $Profile, "--build-status", "success"
     )
@@ -390,14 +442,14 @@ function Invoke-Test {
     $env = Get-DepotToolsEnv
     $outRel = "out\thorium-$Profile"
     Write-Log "Building + running base_unittests and a smoke test of the produced browser."
-    Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") -Args @("-C", $outRel, "base_unittests") -WorkingDirectory $SrcDir -Env $env
-    Invoke-Logged -Exe (Join-Path $SrcDir "$outRel\base_unittests.exe") -Args @("--gtest_shuffle", "--gtest_brief=1") -WorkingDirectory $SrcDir -AllowedExitCodes @(0)
+    Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") -Arguments @("-C", $outRel, "base_unittests") -WorkingDirectory $SrcDir -EnvVars $env
+    Invoke-Logged -Exe (Join-Path $SrcDir "$outRel\base_unittests.exe") -Arguments @("--gtest_shuffle", "--gtest_brief=1") -WorkingDirectory $SrcDir -AllowedExitCodes @(0)
 
     $exe = Get-ChildItem (Join-Path $SrcDir $outRel) -Filter "thorium.exe" -ErrorAction SilentlyContinue
     if (-not $exe) { $exe = Get-ChildItem (Join-Path $SrcDir $outRel) -Filter "chrome.exe" -ErrorAction SilentlyContinue }
     if ($exe) {
         Write-Log "Smoke-testing $($exe.FullName) --headless=new --dump-dom about:blank"
-        Invoke-Logged -Exe $exe.FullName -Args @("--headless=new", "--disable-gpu", "--dump-dom", "about:blank") -AllowedExitCodes @(0)
+        Invoke-Logged -Exe $exe.FullName -Arguments @("--headless=new", "--disable-gpu", "--dump-dom", "about:blank") -AllowedExitCodes @(0)
     }
     Write-Log "Tests passed."
 }
@@ -417,7 +469,7 @@ function Invoke-Analyze {
     $pdb = [System.IO.Path]::ChangeExtension($binary, ".dll.pdb")
 
     $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
-    Invoke-Logged -Exe $py -Args @(
+    Invoke-Logged -Exe $py -Arguments @(
         (Join-Path $ScriptsDir "analyze_isa.py"),
         "--binary", $binary, "--objdump", $objdump, "--symbolizer", $symbolizer, "--pdb", $pdb,
         "--label", $Profile,
@@ -444,7 +496,7 @@ function Invoke-Benchmark {
         "--out", (Join-Path $BuildDir "benchmark-$Profile.json")
     )
     if ($SpeedometerDir) { $cmdArgs += @("--speedometer-dir", $SpeedometerDir) }
-    Invoke-Logged -Exe $py -Args $cmdArgs
+    Invoke-Logged -Exe $py -Arguments $cmdArgs
     Write-Log "Benchmark results written for profile '$Profile'."
 }
 
@@ -489,7 +541,7 @@ function Get-Or-Install-7Zip {
     $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($sevenZip) { return $sevenZip }
     Write-Log "7-Zip not found -- installing via winget." "WARN"
-    Invoke-Logged -Exe "winget" -Args @("install", "--id", "7zip.7zip", "-e",
+    Invoke-Logged -Exe "winget" -Arguments @("install", "--id", "7zip.7zip", "-e",
         "--accept-source-agreements", "--accept-package-agreements")
     $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $sevenZip) { throw "7-Zip still not found after install attempt." }
@@ -513,10 +565,10 @@ function Expand-MiniInstaller([string]$MiniInstallerPath) {
     $stage2 = Join-Path $env:TEMP "thorium-zen5-chrome7z-$([guid]::NewGuid())"
     New-Item -ItemType Directory -Force -Path $stage1, $stage2 | Out-Null
 
-    Invoke-Logged -Exe $sevenZip -Args @("x", $MiniInstallerPath, "-o$stage1", "-y")
+    Invoke-Logged -Exe $sevenZip -Arguments @("x", $MiniInstallerPath, "-o$stage1", "-y")
     $chrome7z = Get-ChildItem $stage1 -Filter "chrome.7z" -Recurse | Select-Object -First 1
     if (-not $chrome7z) { throw "chrome.7z not found inside mini_installer.exe -- extraction layout may have changed upstream." }
-    Invoke-Logged -Exe $sevenZip -Args @("x", $chrome7z.FullName, "-o$stage2", "-y")
+    Invoke-Logged -Exe $sevenZip -Arguments @("x", $chrome7z.FullName, "-o$stage2", "-y")
 
     # The extracted tree is normally <version>/ containing chrome.exe/thorium.exe
     # directly, or nested one level under "Chrome-bin"/"Thorium-bin". Find the
@@ -545,7 +597,7 @@ function Invoke-Installer {
     $iscc = $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $iscc) {
         Write-Log "Inno Setup (ISCC.exe) not found -- installing via winget." "WARN"
-        Invoke-Logged -Exe "winget" -Args @("install", "--id", "JRSoftware.InnoSetup", "-e",
+        Invoke-Logged -Exe "winget" -Arguments @("install", "--id", "JRSoftware.InnoSetup", "-e",
             "--accept-source-agreements", "--accept-package-agreements")
         $iscc = $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
         if (-not $iscc) { throw "Inno Setup still not found after install attempt." }
@@ -558,7 +610,7 @@ function Invoke-Installer {
         if ($m.source_revisions.chromium_src_commit) { $version = $m.source_revisions.chromium_src_commit.Substring(0, 10) }
     }
 
-    Invoke-Logged -Exe $iscc -Args @(
+    Invoke-Logged -Exe $iscc -Arguments @(
         (Join-Path $RepoRoot "installer\thorium-zen5.iss"),
         "/DAppFilesDir=$($extracted.AppFilesDir)",
         "/DMainExeName=$($extracted.MainExeName)",
