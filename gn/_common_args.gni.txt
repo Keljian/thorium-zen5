@@ -57,7 +57,8 @@ enable_platform_hevc = true
 enable_widevine = true
 
 # Trim things a personal build does not need.
-enable_nacl = false
+# (enable_nacl was removed: Chromium 154 no longer declares it, and gn warns
+#  "Build argument has no effect" for args that appear in no declare_args block.)
 disable_fieldtrial_testing_config = true
 optimize_webui = true
 enable_rust = true

@@ -26,16 +26,23 @@
  config("compiler") {
    asmflags = []
    cflags = []
-@@ -336,6 +355,29 @@
+@@ -336,6 +355,36 @@
    ldflags = []
    defines = []
    configs = []
 +
 +  # --- thorium-zen5: Zen 5 CPU targeting ---
-+  # Applied to x64 Windows clang target builds only. Left out of the host
-+  # toolchain and any non-x64 toolchain on purpose: those build tools that
-+  # must run on the build machine and on other architectures, and must not
-+  # inherit a Zen 5 target.
++  # x64 Windows clang builds only.
++  #
++  # NOTE on scope, verified against the generated ninja for Chromium 154:
++  # this is NOT target-only. On a non-cross Windows x64 build the host and
++  # target toolchains coincide, so is_a_target_toolchain is also true for
++  # win_clang_x64_host_* and the rust host build tools, and they receive
++  # -march=znver5 as well (84 refs in the main toolchain.ninja, a handful in
++  # the host ones). That is acceptable HERE only because those tools are
++  # built and run on the same Zen 5 machine, and backward compatibility is
++  # explicitly not a goal of this project. Do not copy this to a cross build
++  # or to anything that ships build tools to other machines.
 +  if (is_win && current_cpu == "x64" && is_clang && is_a_target_toolchain) {
 +    assert(!(use_znver5 && use_generic_avx512),
 +           "use_znver5 and use_generic_avx512 are mutually exclusive -- " +

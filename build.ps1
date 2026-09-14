@@ -316,6 +316,112 @@ function Get-PythonExe {
     return $cmd.Source
 }
 
+function Get-ProgramFilesX86 {
+    <#
+    ${env:ProgramFiles(x86)} is NOT always present. Verified on rohansdesktopry:
+    a PowerShell spawned with a stripped environment had only PROGRAMFILES set,
+    so "${env:ProgramFiles(x86)}\Windows Kits\10" silently collapsed to
+    "\Windows Kits\10" and every Test-Path against it returned false. That
+    turns "tool not installed" into a wrong answer rather than an error, so
+    resolve it defensively.
+    #>
+    $p = [Environment]::GetEnvironmentVariable('ProgramFiles(x86)')
+    if (-not $p) { $p = Join-Path $env:SystemDrive "Program Files (x86)" }
+    return $p
+}
+
+function Get-WindowsKitsRoot {
+    <#
+    Root of the Windows 10/11 SDK install. Registry first, then the
+    conventional path -- never %ProgramFiles(x86)% expansion alone, see
+    Get-ProgramFilesX86 for why that is unreliable.
+    #>
+    $root = $null
+    try {
+        $root = (Get-ItemProperty "HKLM:\SOFTWARE\WOW6432Node\Microsoft\Microsoft SDKs\Windows\v10.0" -ErrorAction Stop).InstallationFolder
+    } catch { }
+    if (-not $root) { $root = Join-Path (Get-ProgramFilesX86) "Windows Kits\10" }
+    return $root.TrimEnd('\')
+}
+
+function Get-RequiredWindowsSdkVersion {
+    <#
+    The exact Windows SDK version THIS Chromium requires, read out of
+    Chromium's own build/vs_toolchain.py rather than hardcoded here, so it
+    tracks automatically whenever `build.ps1 sync` pins a newer Chromium.
+
+    Chromium pins one specific SDK (e.g. 154.0.8037.17 pins 10.0.28000.0) and
+    setup_toolchain.py fails hard if it is absent. It is NOT "any recent SDK".
+    #>
+    $vsToolchain = Join-Path $SrcDir "build\vs_toolchain.py"
+    if (-not (Test-Path $vsToolchain)) { return $null }
+    $m = Select-String -Path $vsToolchain -Pattern "^SDK_VERSION\s*=\s*'([0-9][0-9.]*)'" | Select-Object -First 1
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return $null
+}
+
+function Assert-WindowsToolchain {
+    <#
+    Verify the Windows SDK Chromium pins is actually installed AND complete,
+    before configure does any real work.
+
+    Without this, a missing SDK surfaces only after the zen5 patches and a
+    ~104MB PGO download, as a wall of GN/python traceback ending in
+    'Path "...\include\<ver>\um" ... does not exist' -- which reads like a
+    bug in this pipeline rather than a missing prerequisite. Checked here in
+    about a second instead.
+    #>
+    $required = Get-RequiredWindowsSdkVersion
+    if (-not $required) {
+        Write-Log "Could not read SDK_VERSION from build\vs_toolchain.py -- skipping the SDK precheck (gn gen will still catch a bad toolchain)." "WARN"
+        return
+    }
+
+    $kitsRoot = Get-WindowsKitsRoot
+
+    $need = @(
+        (Join-Path $kitsRoot "Include\$required\um"),
+        (Join-Path $kitsRoot "Include\$required\shared"),
+        (Join-Path $kitsRoot "Include\$required\ucrt"),
+        (Join-Path $kitsRoot "Lib\$required\um\x64")
+    )
+    $missing = @($need | Where-Object { -not (Test-Path $_) })
+    if ($missing.Count -eq 0) {
+        Write-Log "Windows SDK $required present and complete (required by Chromium $(Get-PinnedChromiumTag))."
+        return
+    }
+
+    # Report what IS installed, so the gap is obvious rather than a guess.
+    $installed = @(
+        Get-ChildItem (Join-Path $kitsRoot "Include") -Directory -ErrorAction SilentlyContinue |
+            Where-Object { Test-Path (Join-Path $_.FullName "um") } |
+            ForEach-Object { $_.Name } | Sort-Object
+    )
+    $installedText = if ($installed.Count) { $installed -join ", " } else { "(none with usable headers)" }
+
+    throw @"
+Windows SDK $required is required by Chromium $(Get-PinnedChromiumTag) but is not installed (or is incomplete).
+
+Chromium pins one exact SDK version in build\vs_toolchain.py (SDK_VERSION) and
+build\toolchain\win\setup_toolchain.py. It will not fall back to an older one.
+
+  Required : $required
+  Installed: $installedText
+  SDK root : $kitsRoot
+  Missing  :
+    $($missing -join "`n    ")
+
+To fix, install that exact SDK, then re-run this command:
+  * Visual Studio Installer -> Modify -> "Individual components" ->
+    tick "Windows 11 SDK ($required)"  (search the version in the filter box), or
+  * the standalone Windows SDK installer for $required from
+    https://developer.microsoft.com/windows/downloads/windows-sdk/
+Chromium also wants the SDK's "Debugging Tools for Windows" component.
+
+Nothing has been built or modified -- this check runs before any real work.
+"@
+}
+
 function Get-PinnedChromiumTag {
     $f = Join-Path $BuildDir "chromium-tag.txt"
     if (Test-Path $f) { return (Get-Content $f -Raw).Trim() }
@@ -363,12 +469,102 @@ function Get-JobCount {
 }
 
 function Get-DepotToolsEnv {
-    return @{
-        "PATH" = "$DepotTools;$env:PATH"
+    <#
+    Environment for every depot_tools/gn/ninja child process.
+
+    WINDOWSSDKDIR and ProgramFiles(x86) are set EXPLICITLY rather than
+    inherited. With DEPOT_TOOLS_WIN_TOOLCHAIN=0 (local toolchain, which is
+    what we use), Chromium's build/vs_toolchain.py does:
+
+        if not 'WINDOWSSDKDIR' in os.environ:
+            default = os.path.expandvars('%ProgramFiles(x86)%\\Windows Kits\\10')
+            ...
+        return NormalizePath(os.environ['WINDOWSSDKDIR'])
+
+    so if ProgramFiles(x86) is absent from the environment the expansion
+    yields nothing, the key is never set, and gn gen dies with a bare
+    KeyError: 'WINDOWSSDKDIR' (observed on rohansdesktopry 2026-09-15 when
+    build.ps1 ran from a shell with a stripped environment). Setting both
+    makes the build independent of whatever environment it is launched from
+    -- an interactive shell, a scheduled task, or a remote agent.
+    #>
+    $kits = Get-WindowsKitsRoot
+
+    # Build a MINIMAL PATH instead of inheriting the caller's.
+    #
+    # vcvarsall.bat appends a lot of directories and then runs `set` through
+    # cmd.exe, which has a hard 8191-character command-line limit. Inheriting a
+    # bloated PATH blows it and Chromium surfaces it only as
+    #   Exception: "[...vcvarsall.bat, amd64_x86, 10.0.28000.0, &&, set]"
+    #   failed with error 255
+    # whose actual cause ("The input line is too long.") is never shown.
+    # Measured on rohansdesktopry 2026-09-15: the launching shell had a PATH of
+    # 6798 chars / 143 entries (the real machine+user PATH is 3373 / 71 -- it
+    # had accumulated duplicates), which was enough to fail.
+    #
+    # The build does not need the user's PATH: depot_tools brings its own
+    # python/ninja/gn, and vcvarsall adds the VS and SDK directories itself.
+    # Keeping this list short and explicit makes the build reproducible from
+    # any shell rather than depending on how the launching environment looks.
+    $sysRoot = $env:SystemRoot
+    $pathParts = @(
+        $DepotTools,
+        (Join-Path $sysRoot "system32"),
+        $sysRoot,
+        (Join-Path $sysRoot "System32\Wbem"),
+        (Join-Path $sysRoot "System32\WindowsPowerShell\v1.0")
+    )
+    # Keep git and python reachable by bare name for any script that expects it.
+    foreach ($tool in @("git", "python")) {
+        $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) {
+            $dir = Split-Path -Parent $cmd.Source
+            if ($pathParts -notcontains $dir) { $pathParts += $dir }
+        }
+    }
+    $slimPath = ($pathParts | Where-Object { $_ -and (Test-Path $_) }) -join ';'
+    if ($slimPath.Length -gt 3000) {
+        Write-Log "Constructed PATH is $($slimPath.Length) chars -- unexpectedly long; vcvarsall may hit cmd's 8191-char limit." "WARN"
+    }
+
+    # Not named $env -- that reads as the env: PSDrive and is needlessly
+    # confusing next to a "$env:..." reference.
+    $envVars = @{
+        "PATH" = $slimPath
         "DEPOT_TOOLS_WIN_TOOLCHAIN" = "0"
         "NINJA_SUMMARIZE_BUILD" = "1"
         "NINJA_STATUS" = "[%r processes, %f/%t @ %o/s | %e sec] "
+        "WINDOWSSDKDIR" = $kits
+        "ProgramFiles(x86)" = (Get-ProgramFilesX86)
     }
+
+    # Chromium's build/toolchain/win/setup_toolchain.py parses the output of
+    # `set` after vcvarsall and REQUIRES SYSTEMROOT, TEMP and TMP to be present,
+    # raising 'Environment variable "TMP" required to be set to valid path'
+    # otherwise. It additionally carries HOMEDRIVE/HOMEPATH/USERPROFILE/PATHEXT
+    # through for vpython. Since we hand the child a constructed environment
+    # rather than inheriting one, set them here instead of hoping the launching
+    # shell had them (it may not -- see the PATH note above).
+    $tempDir = $env:TEMP
+    if (-not $tempDir) { $tempDir = [System.IO.Path]::GetTempPath() }
+    $tempDir = $tempDir.TrimEnd('\')
+    if (-not (Test-Path $tempDir)) { New-Item -ItemType Directory -Force -Path $tempDir | Out-Null }
+
+    $envVars["SYSTEMROOT"]  = $sysRoot
+    $envVars["SystemDrive"] = if ($env:SystemDrive) { $env:SystemDrive } else { "C:" }
+    $envVars["TEMP"]        = $tempDir
+    $envVars["TMP"]         = $tempDir
+    $envVars["PATHEXT"]     = if ($env:PATHEXT) { $env:PATHEXT } else { ".COM;.EXE;.BAT;.CMD" }
+    $envVars["ComSpec"]     = if ($env:ComSpec) { $env:ComSpec } else { (Join-Path $sysRoot "system32\cmd.exe") }
+    foreach ($passthrough in @("USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA")) {
+        $v = [Environment]::GetEnvironmentVariable($passthrough)
+        if ($v) { $envVars[$passthrough] = $v }
+    }
+    if (-not $envVars.ContainsKey("USERPROFILE")) {
+        $envVars["USERPROFILE"] = (Join-Path $envVars["SystemDrive"] "Users\Default")
+    }
+
+    return $envVars
 }
 
 function Assert-Prereqs {
@@ -517,6 +713,10 @@ function Invoke-Configure {
     Start-Log "configure"
     Assert-Prereqs
     if (-not (Test-Path $SrcDir)) { throw "No source checkout at $SrcDir. Run '.\build.ps1 sync' first." }
+
+    # Before ANY real work: a missing Windows SDK otherwise only shows up after
+    # the patches and a ~104MB PGO download, as a GN/python traceback.
+    Assert-WindowsToolchain
 
     # zen5 and generic-avx512 both need our declare_args()/flag sites present
     # in the tree. baseline is deliberately stock: no patches at all, so it is
@@ -747,8 +947,8 @@ function Invoke-Package {
 # ---------------------------------------------------------------------------
 function Get-Or-Install-7Zip {
     $candidates = @(
-        "$env:ProgramFiles\7-Zip\7z.exe",
-        "${env:ProgramFiles(x86)}\7-Zip\7z.exe"
+        (Join-Path $env:ProgramFiles "7-Zip\7z.exe"),
+        (Join-Path (Get-ProgramFilesX86) "7-Zip\7z.exe")
     )
     $sevenZip = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if ($sevenZip) { return $sevenZip }
@@ -803,9 +1003,9 @@ function Invoke-Installer {
     Write-Log "Extracted application files to $($extracted.AppFilesDir) (main exe: $($extracted.MainExeName))"
 
     $innoCandidates = @(
-        "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"   # winget's JRSoftware.InnoSetup installs per-user here on some machines
+        (Join-Path (Get-ProgramFilesX86) "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:ProgramFiles "Inno Setup 6\ISCC.exe"),
+        (Join-Path $env:LOCALAPPDATA "Programs\Inno Setup 6\ISCC.exe")   # winget's JRSoftware.InnoSetup installs per-user here
     )
     $iscc = $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $iscc) {

@@ -1,103 +1,99 @@
 {
   "audit_schema_version": 1,
-  "generated_at": null,
-  "generated_by": "scripts/audit_build.py (initial hand-verified pass, before first source sync)",
-  "chromium_version": {
-    "value": null,
-    "note": "Thorium has no pinned Chromium version file in its own meta-repo. Per Thorium's README, it is 'always built with the latest LTS version of Chromium', and win_scripts/upstream_version.py checks out the exact Chromium tag matching the current Thorium release at sync time. This field is filled in by `build.ps1 sync` from the checked-out src/chrome/VERSION file."
-  },
-  "thorium_version": {
-    "meta_repo": "https://github.com/Alex313031/Thorium.git",
-    "meta_repo_commit": "91b29e10e3c934ae187d9e7106fc88db64560eea",
-    "meta_repo_commit_date": "2026-05-08T10:37:37-05:00",
-    "flavor_default": "Win/AVX (infra/thor_ver)",
-    "note": "Thorium ships several prebuilt SIMD flavors (SSE2/SSE3/SSE4.1/AVX/AVX2/AVX-512) selected at setup time via win_scripts/setup.py flags, not a single 'version'. Windows binary releases are distributed from https://github.com/Alex313031/Thorium-Win (a separate, release-only repo)."
-  },
+  "generated_at": "2026-09-14T22:31:20.470676+00:00",
+  "status": "OK",
+  "chromium_version": "154.0.8037.17",
+  "chromium_tag": "154.0.8037.17",
+  "chromium_src_commit": "62d2fcb41a84e4dcefd8c4da7dfa534e6c482854",
   "compiler": {
-    "toolchain": "Clang/LLVM bundled via depot_tools (Chromium's pinned 'clang' package)",
-    "note": "is_clang = true, use_lld = true in win_args.gn. Exact clang --version and LLVM revision are recorded by build.ps1 into build-manifest.json after `gclient runhooks` pulls the pinned toolchain -- must be new enough to recognize -march=znver5 (requires LLVM >= 16; LLVM 19+ recommended for the fullest Zen5 scheduler model). Verified at configure time by scripts/audit_build.py."
+    "path": "C:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\clang-cl.exe",
+    "found": true,
+    "version_string": "clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com/llvm/llvm-project 75adca17d7f5f488193fdf76cd07500e2a12081a)\nTarget: x86_64-pc-windows-msvc\nThread model: posix\nInstalledDir: C:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\nBuild config: +alloc:rpmalloc",
+    "supports_znver5": true,
+    "znver5_probe_returncode": 0,
+    "znver5_probe_output": "# 1 \"NUL\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 460 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"NUL\" 2"
   },
-  "target_cpu": {
-    "gn_target_cpu": "x64",
-    "gn_target_os": "win",
-    "physical_cpu": "AMD Ryzen 9 9950X (Zen 5, 16C/32T)",
-    "note": "target_cpu=x64 is Chromium's ABI/pointer-width selector, unrelated to microarchitecture tuning. Microarchitecture targeting (-march=znver5) is controlled entirely by compiler cflags/ldflags, which Thorium hardcodes per SIMD flavor (see modified_files)."
-  },
-  "target_features": {
-    "stock_thorium_win_args_gn_default": {
-      "use_sse3": true, "use_sse41": true, "use_sse42": true,
-      "use_avx": true, "use_avx2": false, "use_avx512": false, "use_fma": false
-    },
-    "stock_thorium_win_AVX512_args_gn": {
-      "use_sse3": true, "use_sse41": true, "use_sse42": true,
-      "use_avx": true, "use_avx2": true, "use_avx512": true, "use_fma": true
-    },
-    "stock_avx512_feature_set": [
-      "avx512f", "avx512cd", "avx512vl", "avx512bw", "avx512dq",
-      "f16c (via avx2 block)", "lzcnt (via avx2 block)", "bmi2 (via avx2 block)"
+  "target_cpu": null,
+  "target_os": null,
+  "current_args_gn": null,
+  "pgo_enabled": false,
+  "pgo_data_path": null,
+  "lto_enabled": false,
+  "avx512_enabled": false,
+  "znver5_enabled": false,
+  "affected_targets": {
+    "files_referencing_use_generic_avx512": [
+      "build\\config\\compiler\\BUILD.gn"
     ],
-    "stock_avx512_feature_set_note": "Deliberately the 'least common denominator' AVX-512 subset per compiler_opt.gni's own comment ('Only uses AVX-512 instructions common to all processors'). Zen5 additionally has AVX512VNNI, AVX512BITALG, AVX512VPOPCNTDQ, AVX512VBMI, AVX512VBMI2, AVX512IFMA, AVX512BF16, GFNI, VAES, VPCLMULQDQ, movdiri/movdir64b -- none of which stock Thorium enables.",
-    "zen5_profile_target_features": "Not a hand-maintained flag list. gn/win_zen5_args.gn sets use_znver5=true (new arg added by patches/zen5), which replaces the entire manual -mavx512* cflag list with '-march=znver5 -mtune=znver5', letting Clang's znver5 CPU model select the complete correct ISA and scheduling itself, per the project's explicit design requirement."
-  },
-  "pgo_enabled": {
-    "value": true,
-    "mechanism": "chrome_pgo_phase = 2 with pgo_data_path pointing at a downloaded .profdata file (win_scripts/setup.py calls tools/update_pgo_profiles.py --target=win64).",
-    "note": "This PGO profile is Google's generic win64 Chrome profile, trained on generic hardware -- it is NOT Zen5-specific. Regenerating a Zen5-trained profile would require running Chromium's PGO instrumented-build + benchmark-training workflow locally (chrome_pgo_phase=1 instrumented build, run a representative workload, merge .profraw -> .profdata). This is a real, expensive undertaking; tracked as an unresolved question below and left as an opt-in, separate step (not part of the default zen5 profile) rather than silently skipped."
-  },
-  "lto_enabled": {
-    "value": true,
-    "mechanism": "use_thin_lto = true, thin_lto_enable_optimizations = true (ThinLTO, not full/monolithic LTO)."
-  },
-  "avx512_enabled": {
-    "gn_arg": "use_avx512",
-    "default_in_stock_win_args_gn": false,
-    "enabled_by": "other/AVX512/win_AVX512_args.gn (a distinct args.gn flavor, not a command-line flag to build_win.sh)",
-    "propagation_confirmed_in_meta_repo": [
-      "src/build/config/compiler/BUILD.gn (cflags/ldflags, x64 Windows AND x64 Linux/Mac branches)",
-      "src/build/config/win/BUILD.gn (cflags, and a second ldflags block gating ThinLTO backend -march for release/non-component builds)",
-      "src/build/config/compiler_opt.gni (declare_args + use_fma derivation + sanity asserts/warnings)",
-      "src/v8/BUILD.gn (separate cflags application for V8's own compile targets, Windows AND non-Windows branches)",
-      "src/chrome/installer/linux/BUILD.gn (package name suffix only -- '_AVX512'; irrelevant to Windows)"
-    ],
-    "propagation_NOT_found_in_meta_repo": "Chromium's own third-party SIMD libraries (highway, dav1d, libjpeg-turbo, libvpx/libaom, zlib, skia opts, etc.) are NOT touched by Thorium's use_avx512 flag anywhere in this meta-repo. This strongly suggests those libraries keep Chromium's stock behavior: compile multiple SIMD variants and pick one via CPU-feature runtime dispatch (cpu-features / base::CPU checks), independent of the use_avx512 GN arg. This must be re-verified once the real Chromium source tree exists (scripts/audit_build.py's 'source-tree' pass) -- Thorium's own meta-repo only contains files Thorium itself modifies, not the full Chromium tree, so this cannot be fully confirmed from the meta-repo alone.",
-    "root_cause_of_generic_avx512": "src/build/config/compiler/BUILD.gn and src/build/config/win/BUILD.gn hardcode `-mllvm:-march=skylake-avx512` (Windows) / `-Wl,-mllvm,-march=skylake-avx512` (Linux/Mac) as the ThinLTO backend codegen/scheduling target whenever use_avx512=true, regardless of host CPU vendor. This is the exact 'generic AVX-512 treated as final target' problem described in the task."
-  },
-  "affected_targets_classification": {
-    "A_safe_for_zen5_march": [
-      "src/build/config/compiler/BUILD.gn cflags/ldflags (x64 is_win branch)",
-      "src/build/config/win/BUILD.gn cflags/ldflags",
-      "src/v8/BUILD.gn cflags (V8 builtins/snapshot compile units)"
-    ],
-    "B_already_cpu_dispatched_leave_alone": [
-      "third_party/highway (Google Highway) -- runtime dispatch, compiles multiple targets",
-      "third_party/dav1d -- runtime dispatch via its own cpu.c detection",
-      "third_party/libjpeg_turbo -- runtime dispatch (SIMD dispatch table)",
-      "third_party/skia -- opts_*.cpp runtime dispatch",
-      "third_party/zlib -- runtime dispatch for its SIMD paths",
-      "NOTE: presence/exact list to be confirmed by scripts/audit_build.py once real Chromium source exists; classification here is based on documented Chromium upstream architecture, not yet re-verified against this checkout."
-    ],
-    "C_must_stay_generic": [
-      "NaCl / cross-compilation toolchains (not used on this single-machine Windows target; not built)",
-      "build/toolchain/* GN toolchain definitions for non-host toolchains (e.g. any 32-bit or ARM helper binaries produced during the build, such as the x86 or WOA subprocess helpers, if any) -- must not receive znver5 flags"
-    ],
-    "D_third_party_special_handling": [
-      "other/AVX2/third_party/opus -- Thorium's own AVX2-tuned Opus build files, reused verbatim for the AVX-512 flavor via win_scripts/setup.py's copy_avx512(). Left untouched by the zen5 patches; still copied in by build.ps1 configure."
-    ],
-    "E_unknown_pending_real_source": [
-      "Everything not explicitly listed above -- the meta-repo does not contain the full Chromium tree, so a full A/B/C/D classification of every third_party target requires re-running scripts/audit_build.py's source-tree pass after `build.ps1 sync`."
+    "files_referencing_use_znver5": [
+      "build\\config\\compiler\\BUILD.gn"
     ]
   },
+  "third_party_dispatch_survey": {
+    "third_party/highway": {
+      "exists": true,
+      "runtime_dispatch_signature_found_in": [
+        "third_party\\highway\\src\\hwy\\targets.cc",
+        "third_party\\highway\\src\\hwy\\targets_test.cc",
+        "third_party\\highway\\src\\hwy\\examples\\benchmark.cc",
+        "third_party\\highway\\src\\hwy\\tests\\blockwise_test.cc",
+        "third_party\\highway\\src\\hwy\\tests\\list_targets.cc"
+      ],
+      "is_runtime_dispatched": true,
+      "scan_truncated": false,
+      "scan_file_limit": 400
+    },
+    "third_party/dav1d": {
+      "exists": true,
+      "runtime_dispatch_signature_found_in": [
+        "third_party\\dav1d\\libdav1d\\src\\cpu.c",
+        "third_party\\dav1d\\libdav1d\\src\\arm\\cpu.c",
+        "third_party\\dav1d\\libdav1d\\src\\loongarch\\cpu.c",
+        "third_party\\dav1d\\libdav1d\\src\\ppc\\cpu.c",
+        "third_party\\dav1d\\libdav1d\\src\\riscv\\cpu.c"
+      ],
+      "is_runtime_dispatched": true,
+      "scan_truncated": false,
+      "scan_file_limit": 400
+    },
+    "third_party/libjpeg_turbo": {
+      "exists": true,
+      "runtime_dispatch_signature_found_in": [
+        "third_party\\libjpeg_turbo\\simd\\arm\\aarch32\\jsimd.c",
+        "third_party\\libjpeg_turbo\\simd\\arm\\aarch64\\jsimd.c",
+        "third_party\\libjpeg_turbo\\simd\\i386\\jsimd.c",
+        "third_party\\libjpeg_turbo\\simd\\x86_64\\jsimd.c",
+        "third_party\\libjpeg_turbo\\src\\jccolor.c"
+      ],
+      "is_runtime_dispatched": true,
+      "scan_truncated": false,
+      "scan_file_limit": 400
+    },
+    "third_party/skia": {
+      "exists": true,
+      "runtime_dispatch_signature_found_in": [],
+      "is_runtime_dispatched": null,
+      "scan_truncated": true,
+      "scan_file_limit": 400
+    },
+    "third_party/zlib": {
+      "exists": true,
+      "runtime_dispatch_signature_found_in": [
+        "third_party\\zlib\\adler32.c",
+        "third_party\\zlib\\cpu_features.c",
+        "third_party\\zlib\\crc32.c",
+        "third_party\\zlib\\deflate.c",
+        "third_party\\zlib\\chromeconf.h"
+      ],
+      "is_runtime_dispatched": true,
+      "scan_truncated": false,
+      "scan_file_limit": 400
+    }
+  },
   "modified_files": [
-    "src/build/config/compiler_opt.gni",
-    "src/build/config/compiler/BUILD.gn",
-    "src/build/config/win/BUILD.gn",
-    "src/v8/BUILD.gn"
+    "build\\config\\compiler\\BUILD.gn"
   ],
   "unresolved_questions": [
-    "Exact bundled clang/LLVM version is not yet known (depends on Chromium revision at sync time); must be checked for znver5 recognition before first zen5 build (build.ps1 configure fails loudly if not recognized).",
-    "Whether Chromium's third-party SIMD libraries have any additional AVX-512 build-time (not runtime-dispatch) specialization worth pinning to znver5 -- requires the real source tree.",
-    "Whether to attempt a Zen5-trained PGO profile (expensive: instrumented build + representative workload + profile merge) instead of Google's generic win64 profile. Left as an explicit opt-in ('build.ps1 build -TrainPgo') rather than default.",
-    "infra/upgrader submodule points at a third-party fork (hezhizheng/thorium-win-upgrade), not an Alex313031 repo -- update.ps1 does not depend on it; noted for awareness only.",
-    "Thorium-Win (github.com/Alex313031/Thorium-Win) appears to be a release-binary distribution repo rather than an alternate source tree; assumed so here. If wrong, update.ps1's upstream-check step should also poll it."
+    "third_party/skia: bounded scan (first 400 files) found no runtime-dispatch signature. This is NOT proof of absence -- re-run `audit --deep` to scan exhaustively."
   ]
 }

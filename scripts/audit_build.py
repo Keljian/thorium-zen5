@@ -109,13 +109,33 @@ def get_clang_version(depot_tools_dir: Path, src_dir: Path) -> dict:
     return result
 
 
-def grep_tree(src_dir: Path, pattern: str, include_globs, max_hits=500):
+def grep_tree(src_dir: Path, pattern: str, include_globs, max_hits=500,
+              max_files=None):
+    """Grep files matching include_globs. Returns (hits, truncated).
+
+    max_files bounds how many files are *examined* per call. Without it a
+    signature that is simply absent causes a full walk of the subtree, reading
+    every file: on the real checkout that made `build.ps1 audit` take 1h08m
+    (measured on rohansdesktopry 2026-09-14), and audit runs twice per
+    pipeline. third_party/skia alone is tens of thousands of files, and every
+    read is also seen by the on-access virus scanner.
+
+    Bounding it changes the third_party survey from exhaustive to a sample --
+    so callers must report `truncated` rather than presenting a bounded "not
+    found" as if it were a proven absence.
+    """
     hits = []
+    examined = 0
+    truncated = False
     regex = re.compile(pattern)
     for glob in include_globs:
         for path in src_dir.glob(glob):
             if not path.is_file():
                 continue
+            if max_files is not None and examined >= max_files:
+                truncated = True
+                return hits, truncated
+            examined += 1
             try:
                 text = path.read_text(errors="ignore")
             except OSError:
@@ -123,11 +143,11 @@ def grep_tree(src_dir: Path, pattern: str, include_globs, max_hits=500):
             if regex.search(text):
                 hits.append(str(path.relative_to(src_dir)))
             if len(hits) >= max_hits:
-                return hits
-    return hits
+                return hits, truncated
+    return hits, truncated
 
 
-def audit(repo_root: Path) -> dict:
+def audit(repo_root: Path, deep: bool = False) -> dict:
     src_dir = find_src_dir(repo_root)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
@@ -144,10 +164,12 @@ def audit(repo_root: Path) -> dict:
     depot_tools_dir = repo_root / "depot_tools"
     clang_info = get_clang_version(depot_tools_dir, src_dir)
 
-    avx512_files = grep_tree(src_dir, r"use_generic_avx512", ["build/config/**/*.gn", "build/config/**/*.gni",
-                                                        "v8/BUILD.gn"])
-    znver5_files = grep_tree(src_dir, r"use_znver5|znver5", ["build/config/**/*.gn", "build/config/**/*.gni",
-                                                               "v8/BUILD.gn"])
+    # These globs are small and bounded by construction (build/config + v8),
+    # so they stay exhaustive.
+    avx512_files, _ = grep_tree(src_dir, r"use_generic_avx512",
+                                ["build/config/**/*.gn", "build/config/**/*.gni", "v8/BUILD.gn"])
+    znver5_files, _ = grep_tree(src_dir, r"use_znver5|znver5",
+                                ["build/config/**/*.gn", "build/config/**/*.gni", "v8/BUILD.gn"])
 
     runtime_dispatch_findings = {}
     for rel, sig in RUNTIME_DISPATCHED_CANDIDATES.items():
@@ -155,11 +177,17 @@ def audit(repo_root: Path) -> dict:
         if not d.exists():
             runtime_dispatch_findings[rel] = {"exists": False}
             continue
-        matched_files = grep_tree(src_dir, sig, [f"{rel}/**/*.cc", f"{rel}/**/*.c", f"{rel}/**/*.h"], max_hits=5)
+        scan_limit = None if deep else 400
+        matched_files, truncated = grep_tree(
+            src_dir, sig, [f"{rel}/**/*.cc", f"{rel}/**/*.c", f"{rel}/**/*.h"],
+            max_hits=5, max_files=scan_limit)
         runtime_dispatch_findings[rel] = {
             "exists": True,
             "runtime_dispatch_signature_found_in": matched_files,
-            "is_runtime_dispatched": len(matched_files) > 0,
+            # Only a positive result is conclusive under a bounded scan.
+            "is_runtime_dispatched": True if matched_files else (False if not truncated else None),
+            "scan_truncated": truncated,
+            "scan_file_limit": scan_limit,
         }
 
     args_gn_path = src_dir / "out" / "thorium" / "args.gn"
@@ -210,7 +238,13 @@ def audit(repo_root: Path) -> dict:
             "applied yet. Run `.\\build.ps1 configure -Profile zen5` (which applies patches/zen5 first)."
         )
     for rel, info in runtime_dispatch_findings.items():
-        if info.get("exists") and not info.get("is_runtime_dispatched"):
+        if info.get("exists") and info.get("is_runtime_dispatched") is None:
+            result["unresolved_questions"].append(
+                f"{rel}: bounded scan (first {info.get('scan_file_limit')} files) found no runtime-dispatch "
+                "signature. This is NOT proof of absence -- re-run `audit --deep` to scan exhaustively."
+            )
+            continue
+        if info.get("exists") and info.get("is_runtime_dispatched") is False:
             result["unresolved_questions"].append(
                 f"{rel} exists but no runtime-dispatch signature was found by this heuristic grep -- "
                 "verify manually whether it needs a build-time zen5 specialization instead."
@@ -223,6 +257,9 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo-root", default=r"C:\thorium")
     ap.add_argument("--out", default=None, help="Defaults to <repo-root>/build/audit.json")
+    ap.add_argument("--deep", action="store_true",
+                    help="Scan third_party subtrees exhaustively. Much slower "
+                         "(measured 1h08m on a real checkout) -- the default is a bounded sample.")
     args = ap.parse_args()
 
     repo_root = Path(args.repo_root)
@@ -230,7 +267,7 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        result = audit(repo_root)
+        result = audit(repo_root, deep=args.deep)
     except Exception as e:  # noqa: BLE001 - top-level tool, must report not crash silently
         print(f"AUDIT INTERNAL ERROR: {e}", file=sys.stderr)
         sys.exit(2)
