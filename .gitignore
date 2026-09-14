@@ -1,0 +1,32 @@
+# Upstream checkouts and toolchains -- huge, fetched by build.ps1 sync, never vendored.
+/depot_tools/
+/upstream/
+/src/
+/.gclient
+/.gclient_entries
+/.cipd/
+
+# Generated build artifacts -- reproducible from build.ps1; keep directory
+# structure (via .gitkeep) but not contents.
+/build/*
+!/build/.gitkeep
+!/build/audit.json
+/build/logs/
+/build/current-overlay.txt
+
+# Packaged releases -- large binaries; distribute via GitHub Releases if
+# you want them off this machine, don't commit them to git history.
+/releases/*
+!/releases/.gitkeep
+
+# Local benchmark inputs (e.g. a cloned Speedometer checkout)
+/benchmarks/speedometer/
+
+# Misc
+*.log
+*.pdb
+*.exe
+*.dll
+*.7z
+Thumbs.db
+.vs/
