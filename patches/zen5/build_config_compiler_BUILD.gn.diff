@@ -1,6 +1,6 @@
 --- a/build/config/compiler/BUILD.gn
 +++ b/build/config/compiler/BUILD.gn
-@@ -324,6 +324,25 @@
+@@ -324,6 +324,52 @@
  # See also "runtime_library" below for related stuff and a discussion about
  # where stuff should go. Put warning related stuff in the "warnings" config.
  
@@ -17,6 +17,33 @@
 +  # backward compatibility is explicitly not a goal of this project.
 +  use_znver5 = false
 +
++  # Which -march the zen5 profile actually emits.
++  #
++  # Defaults to znver4, NOT znver5, and that is deliberate. Measured on this
++  # toolchain (Chromium 154, bundled clang 24.0.0git, Windows, ThinLTO,
++  # is_official_build): -march=znver5 miscompiles. Linking
++  # transport_security_state_generator.exe fails with
++  #     lld-link: error: <unknown>:0: Missing .seh_endepilogue in
++  #               ?GetVlogLevelHelper@logging@@YAHPEBD_K@Z
++  # plus dropped `vector deleting dtor' thunks -- malformed Windows SEH unwind
++  # data out of the LTO backend. Isolated by building the identical target
++  # against each candidate:
++  #     (stock, no -march)  -> builds
++  #     skylake-avx512      -> builds, 1m48s, 0 errors
++  #     znver4              -> builds, 1m39s, 0 errors
++  #     znver5              -> FAILS
++  # So it is znver5 specifically, not AVX-512 and not AMD targeting.
++  #
++  # znver4 is the right fallback rather than a climbdown: Zen 4 and Zen 5 share
++  # essentially the same AVX-512 feature set (VNNI, VBMI, VBMI2, BITALG,
++  # VPOPCNTDQ, IFMA, BF16, GFNI, VAES, VPCLMULQDQ), so the full instruction set
++  # is still enabled. What is lost is Zen 5's scheduling model and its full
++  # 512-bit datapath assumptions -- tuning, not capability.
++  #
++  # Set this to "znver5" to retry once the toolchain moves; the failure is loud
++  # (link error), never silent.
++  zen5_march = "znver4"
++
 +  # Vendor-neutral AVX-512 (the F/CD/VL/BW/DQ subset common to all AVX-512
 +  # parts, with generic AVX-512 scheduling). Exists purely as the comparison
 +  # point for use_znver5 in scripts/compare_builds.py.
@@ -26,7 +53,7 @@
  config("compiler") {
    asmflags = []
    cflags = []
-@@ -336,6 +355,36 @@
+@@ -336,6 +382,56 @@
    ldflags = []
    defines = []
    configs = []
@@ -49,14 +76,34 @@
 +           "pick one; they set conflicting -march values.")
 +    if (use_znver5) {
 +      cflags += [
-+        "-march=znver5",
-+        "-mtune=znver5",
++        "-march=$zen5_march",
++        "-mtune=$zen5_march",
 +      ]
++      # The ThinLTO backend MUST be told the same target.
++      #
++      # This was originally left out on the theory that clang's per-function
++      # target-cpu/target-features attributes in the bitcode would be enough.
++      # They are not. Verified on Chromium 154: without this, linking
++      # transport_security_state_generator.exe fails with undefined symbols for
++      # base's own inline functions (logging::LogMessage, perfetto::...) because
++      # the LTO backend codegens at a different default CPU than the bitcode was
++      # compiled for, and definitions that cannot be inlined across the feature
++      # mismatch get dropped. Flipping use_znver5 off made the identical link
++      # succeed, which is what isolated it.
++      #
++      # This mirrors what Thorium's AVX-512 flavour did (-mllvm:-march=
++      # skylake-avx512), so the spelling is known-good for lld-link here.
++      if (use_thin_lto) {
++        ldflags += [ "-mllvm:-march=$zen5_march" ]
++      }
 +    } else if (use_generic_avx512) {
 +      cflags += [
 +        "-march=skylake-avx512",
 +        "-mtune=skylake-avx512",
 +      ]
++      if (use_thin_lto) {
++        ldflags += [ "-mllvm:-march=skylake-avx512" ]
++      }
 +    }
 +  }
 +  # --- end thorium-zen5: Zen 5 CPU targeting ---
