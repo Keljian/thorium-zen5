@@ -307,7 +307,12 @@ function Invoke-Sync {
         Write-Log "Existing checkout found at $SrcDir -- updating."
         Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "origin/main") -WorkingDirectory (Join-Path $SrcDir "v8") -EnvVars $env
         Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "origin/main") -WorkingDirectory $SrcDir -EnvVars $env
-        Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Arguments @("fetch", "--tags") -WorkingDirectory $SrcDir -EnvVars $env -AllowedExitCodes @(0,1)
+        # NOT `gclient fetch --tags` -- this depot_tools version's `gclient
+        # fetch` subcommand doesn't accept --tags at all ("no such option",
+        # exit 2, confirmed on rohansdesktopry 2026-09-14). Fetching tags
+        # via plain git is unambiguous and is redundant-safe with the
+        # --with_tags on the gclient sync -D call right below anyway.
+        Invoke-Logged -Exe "git" -Arguments @("fetch", "origin", "--tags") -WorkingDirectory $SrcDir -EnvVars $env
     }
 
     Write-Log "Running gclient sync -D (this pulls all deps: V8, WebRTC, ANGLE, etc. Long.)"
