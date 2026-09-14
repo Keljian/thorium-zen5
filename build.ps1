@@ -679,7 +679,8 @@ function Invoke-Installer {
 
     $innoCandidates = @(
         "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
-        "$env:ProgramFiles\Inno Setup 6\ISCC.exe"
+        "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"   # winget's JRSoftware.InnoSetup installs per-user here on some machines
     )
     $iscc = $innoCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
     if (-not $iscc) {
