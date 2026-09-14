@@ -4,13 +4,20 @@
     Thorium Zen5 build orchestrator.
 
 .DESCRIPTION
-    Personal Windows Chromium/Thorium build pipeline tuned for AMD Ryzen 9
-    9950X (Zen 5) / AVX-512. See docs/BUILD.md and docs/ARCHITECTURE.md.
+    Personal Windows build of STOCK Chromium, tuned for AMD Ryzen 9 9950X
+    (Zen 5) / AVX-512. Tracks the current Chromium *stable* release and
+    applies this project's own Zen5 compiler-targeting patches to it.
+
+    The project no longer overlays Thorium's sources (2026-09-14): Thorium's
+    tree pinned Chromium 138 while stable was 154, and its release tags all
+    pointed at one stale commit. The Zen5 work was always ours and applies to
+    stock Chromium directly. The name is kept for continuity.
+    See docs/BUILD.md and docs/ARCHITECTURE.md.
 
     Subcommands:
         audit       Inspect the synced source tree + toolchain, write build/audit.json
-        sync        fetch/checkout Chromium + pull Thorium meta-repo (long: hours)
-        configure   Overlay Thorium sources, apply zen5 patches, gn gen (fast)
+        sync        fetch Chromium, pin to current stable tag, gclient sync (long)
+        configure   apply zen5 patches, write args.gn, gn gen (fast)
         build       autoninja the browser + installer for -Profile (long: hours)
         test        run Chromium's own fast unit/browser test subset
         analyze     disassemble the built binary, report real ISA usage
@@ -57,7 +64,6 @@ $ProgressPreference = "SilentlyContinue"
 # ---------------------------------------------------------------------------
 $RepoRoot     = $PSScriptRoot
 $DepotTools   = Join-Path $RepoRoot "depot_tools"
-$ThoriumMeta  = Join-Path $RepoRoot "upstream\Thorium"
 $SrcDir       = Join-Path $RepoRoot "src"
 $BuildDir     = Join-Path $RepoRoot "build"
 $LogsDir      = Join-Path $BuildDir "logs"
@@ -65,7 +71,6 @@ $ScriptsDir   = Join-Path $RepoRoot "scripts"
 $GnDir        = Join-Path $RepoRoot "gn"
 $PatchesDir   = Join-Path $RepoRoot "patches\zen5"
 $ReleasesDir  = Join-Path $RepoRoot "releases"
-$OverlayMarker = Join-Path $BuildDir "current-overlay.txt"
 
 New-Item -ItemType Directory -Force -Path $BuildDir, $LogsDir, $ReleasesDir | Out-Null
 
@@ -245,44 +250,56 @@ function Invoke-NativeCapture {
     #>
     param(
         [Parameter(Mandatory)][string]$Exe,
-        [string[]]$Arguments = @()
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory = $null
     )
     $ErrorActionPreference = "Continue"
     $global:LASTEXITCODE = 0
-    $output = & $Exe @Arguments 2>&1 | ForEach-Object { $_.ToString() }
+    $pushed = $false
+    try {
+        if ($WorkingDirectory) { Push-Location -LiteralPath $WorkingDirectory; $pushed = $true }
+        $output = & $Exe @Arguments 2>&1 | ForEach-Object { $_.ToString() }
+    } finally {
+        if ($pushed) { Pop-Location }
+    }
     return [PSCustomObject]@{
         ExitCode = $LASTEXITCODE
         Output   = (@($output) -join "`n")
     }
 }
 
-function Resolve-ThoriumLatestStableTag {
+function Resolve-ChromiumStableTag {
     <#
-    Returns the tag name of Thorium's current latest STABLE (non-prerelease,
-    non-draft) GitHub release. We deliberately do NOT track the `main`
-    branch: Alex313031/Thorium's own version-specific work (patches, GN
-    args, win_scripts) lives on per-version branches (e.g. M150, M144) that
-    get tagged releases roughly every 3-4 weeks, while `main` itself can go
-    stale for months at a time (verified: main's last commit was 2026-05-08
-    while M151 shipped 2026-08-03 and M152(beta) 2026-08-23 from other
-    branches). GitHub's /releases/latest endpoint already excludes
-    prereleases/drafts by definition, so this always resolves to the
-    newest tagged release Thorium's maintainers consider stable -- not the
-    newest beta, and not whatever main happens to contain.
+    Returns the current Chromium STABLE release version for Windows (e.g.
+    "154.0.8037.17"), which is also the git tag name in chromium/src.
+
+    This project builds stock Chromium, not Thorium. That is a deliberate
+    change (2026-09-14): Thorium's tree pinned Chromium 138 via its own
+    upstream_version.sh while stable was 154 -- roughly a year of unapplied
+    upstream security fixes -- and its release tags (M144..M152) all pointed
+    at one stale commit, so there was no "newer Thorium" to track. What this
+    project actually needed from Thorium was never its overlay; it was the
+    Zen5 compiler targeting, which is ours and applies to stock Chromium
+    directly. See docs/ARCHITECTURE.md.
+
+    Tracking *stable* (not trunk) is the security-relevant choice: trunk is
+    whatever landed an hour ago and can be broken outright, while stable is
+    the branch Google ships CVE fixes on.
     #>
-    $uri = "https://api.github.com/repos/Alex313031/Thorium/releases/latest"
+    $uri = "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=1"
     try {
         $resp = Invoke-RestMethod -Uri $uri -Headers @{ "User-Agent" = "thorium-zen5-build.ps1" } -UseBasicParsing
     } catch {
-        throw "Failed to resolve Thorium's latest stable release from $uri -- check network access and GitHub API rate limits (unauthenticated: 60 req/hr): $_"
+        throw "Failed to resolve the current Chromium stable version from $uri -- check network access: $_"
     }
-    if (-not $resp.tag_name) {
-        throw "GitHub's releases/latest response for Alex313031/Thorium had no tag_name field: $($resp | ConvertTo-Json -Compress -Depth 3)"
+    $version = @($resp)[0].version
+    if (-not $version) {
+        throw "chromiumdash returned no 'version' field for channel=Stable platform=Windows: $($resp | ConvertTo-Json -Compress -Depth 3)"
     }
-    if ($resp.prerelease) {
-        Write-Log "WARNING: GitHub returned a prerelease as Thorium's 'latest' ($($resp.tag_name)) -- using it anyway since the API is the source of truth here." "WARN"
+    if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+        throw "chromiumdash returned something that is not a Chromium version tag: '$version'"
     }
-    return [string]$resp.tag_name
+    return [string]$version
 }
 
 function Get-PythonExe {
@@ -297,6 +314,47 @@ function Get-PythonExe {
     if (-not $cmd) { throw "No python interpreter found on PATH (looked for 'python' then 'python3')." }
     if (-not $cmd.Source) { throw "Resolved python command '$($cmd.Name)' has no file path (Store alias shim?). Install real CPython or put python.exe on PATH." }
     return $cmd.Source
+}
+
+function Get-PinnedChromiumTag {
+    $f = Join-Path $BuildDir "chromium-tag.txt"
+    if (Test-Path $f) { return (Get-Content $f -Raw).Trim() }
+    return "<unpinned>"
+}
+
+function Get-UnknownGnArgs {
+    <#
+    Returns every argument assigned in args.gn that this Chromium checkout
+    does not actually define.
+
+    gn gen reports unknown arguments ONE AT A TIME, so porting an arg set
+    (as we did moving off Thorium's non-stock use_sse41/use_avx512/... args)
+    otherwise means one slow gn gen per bad line. This lists them all at once.
+
+    `gn args --list` needs an existing build dir, so it is run against the
+    same out dir gn gen just rejected -- gn still writes enough there to
+    answer the query even when generation failed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ArgsGnPath,
+        [Parameter(Mandatory)][string]$OutDirRelative
+    )
+    $assigned = @()
+    foreach ($line in (Get-Content $ArgsGnPath)) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') { $assigned += $matches[1] }
+    }
+    $listed = Invoke-NativeCapture -Exe (Join-Path $DepotTools "gn.bat") `
+        -Arguments @("args", $OutDirRelative, "--list", "--short") -WorkingDirectory $SrcDir
+    if ($listed.ExitCode -ne 0) {
+        Write-Log "Could not enumerate gn's known args (exit $($listed.ExitCode)); falling back to gn's own message." "WARN"
+        return @()
+    }
+    $known = @{}
+    foreach ($line in ($listed.Output -split "`n")) {
+        if ($line -match '^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=') { $known[$matches[1]] = $true }
+    }
+    if ($known.Count -eq 0) { return @() }
+    return @($assigned | Where-Object { -not $known.ContainsKey($_) } | Select-Object -Unique)
 }
 
 function Get-JobCount {
@@ -334,7 +392,7 @@ function Invoke-Audit {
 }
 
 # ---------------------------------------------------------------------------
-# sync  (long-running: fetch Chromium via depot_tools, pull Thorium meta-repo)
+# sync  (long-running: fetch Chromium, pin to the current stable tag, sync deps)
 # ---------------------------------------------------------------------------
 function Invoke-Sync {
     Start-Log "sync"
@@ -352,18 +410,33 @@ function Invoke-Sync {
             Remove-Item (Join-Path $RepoRoot "chromium-fetch-tmp") -Recurse -Force -ErrorAction SilentlyContinue
         }
     } else {
-        Write-Log "Existing checkout found at $SrcDir -- updating."
-        Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "origin/main") -WorkingDirectory (Join-Path $SrcDir "v8") -EnvVars $env
-        Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "origin/main") -WorkingDirectory $SrcDir -EnvVars $env
+        Write-Log "Existing checkout found at $SrcDir."
         # NOT `gclient fetch --tags` -- this depot_tools version's `gclient
         # fetch` subcommand doesn't accept --tags at all ("no such option",
         # exit 2, confirmed on rohansdesktopry 2026-09-14). Fetching tags
-        # via plain git is unambiguous and is redundant-safe with the
-        # --with_tags on the gclient sync -D call right below anyway.
+        # via plain git is unambiguous.
+        Write-Log "Fetching Chromium release tags."
         Invoke-Logged -Exe "git" -Arguments @("fetch", "origin", "--tags") -WorkingDirectory $SrcDir -EnvVars $env
     }
 
-    Write-Log "Running gclient sync -D (this pulls all deps: V8, WebRTC, ANGLE, etc. Long.)"
+    # Pin to the current Chromium STABLE release, never trunk. build/chromium-tag.txt
+    # records what we're on so a re-sync with no upstream release is a cheap no-op.
+    Write-Log "Resolving current Chromium stable version..."
+    $targetTag = Resolve-ChromiumStableTag
+    $tagMarkerFile = Join-Path $BuildDir "chromium-tag.txt"
+    $currentTag = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
+    Write-Log "Chromium stable is $targetTag (checkout currently pinned at: $(if ($currentTag) { $currentTag } else { '<unpinned>' }))"
+
+    $tagExists = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "rev-parse", "--verify", "--quiet", "refs/tags/$targetTag")
+    if ($tagExists.ExitCode -ne 0) {
+        throw ("Chromium stable tag '$targetTag' is not present in $SrcDir even after fetching tags. " +
+               "chromiumdash may have announced a release before the tag was pushed to chromium.googlesource.com -- retry shortly.")
+    }
+
+    Write-Log "Checking out Chromium tag $targetTag (this is the version that will be built)."
+    Invoke-Logged -Exe "git" -Arguments @("checkout", "-f", "tags/$targetTag") -WorkingDirectory $SrcDir -EnvVars $env
+
+    Write-Log "Running gclient sync -D against that tag's DEPS (pulls V8, WebRTC, ANGLE, etc. Long.)"
     Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") `
         -Arguments @("sync", "--with_branch_heads", "--with_tags", "-f", "-R", "-D") `
         -WorkingDirectory $SrcDir -EnvVars $env
@@ -371,169 +444,47 @@ function Invoke-Sync {
     Write-Log "Running gclient runhooks (pulls pinned clang/Windows toolchain files)."
     Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Arguments @("runhooks") -WorkingDirectory $SrcDir -EnvVars $env
 
-    Write-Log "Resolving Thorium's latest stable (non-prerelease) release tag from GitHub..."
-    $targetTag = Resolve-ThoriumLatestStableTag
-    Write-Log "Target Thorium meta-repo tag: $targetTag"
-    $tagMarkerFile = Join-Path $BuildDir "thorium-tag.txt"
-    $currentTag = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
-
-    if (-not (Test-Path (Join-Path $ThoriumMeta ".git"))) {
-        Write-Log "No existing Thorium meta-repo checkout -- cloning tag '$targetTag'."
-        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ThoriumMeta) | Out-Null
-        Invoke-Logged -Exe "git" -Arguments @("clone", "--depth", "1", "--branch", $targetTag, "https://github.com/Alex313031/Thorium.git", $ThoriumMeta)
-        Set-Content -Path $tagMarkerFile -Value $targetTag
-    } elseif ($currentTag -ne $targetTag) {
-        Write-Log "Thorium meta-repo is at '$currentTag' -- updating to newer stable tag '$targetTag'."
-        Invoke-Logged -Exe "git" -Arguments @("fetch", "--depth", "1", "origin", "refs/tags/${targetTag}:refs/tags/${targetTag}") -WorkingDirectory $ThoriumMeta
-        Invoke-Logged -Exe "git" -Arguments @("checkout", "--force", $targetTag) -WorkingDirectory $ThoriumMeta
-        Set-Content -Path $tagMarkerFile -Value $targetTag
-    } else {
-        Write-Log "Thorium meta-repo already at latest stable tag '$targetTag' -- nothing to do."
-    }
-
-    Write-Log "Sync complete."
+    Set-Content -Path $tagMarkerFile -Value $targetTag
+    Write-Log "Sync complete -- Chromium $targetTag."
     Invoke-Audit
 }
 
 # ---------------------------------------------------------------------------
-# configure (overlay Thorium source for the profile's flavor, apply zen5
-# patches, write args.gn, gn gen). Fast (minutes), safe to re-run.
+# configure (apply zen5 patches, write args.gn, gn gen).
+# Fast (minutes), safe to re-run.
 # ---------------------------------------------------------------------------
-function Get-OverlayFlavorForProfile([string]$p) {
-    if ($p -eq "baseline") { return "stock" } else { return "avx512" }
-}
+function Invoke-Zen5Patches {
+    <#
+    Apply the Zen5 compiler-targeting patches to the stock Chromium tree.
 
-function Copy-DirOverlay([string]$SrcSub, [string]$DstSub) {
-    $s = Join-Path $ThoriumMeta $SrcSub
-    $d = Join-Path $SrcDir $DstSub
-    if (-not (Test-Path $s)) { throw "Overlay source missing: $s" }
-    New-Item -ItemType Directory -Force -Path $d | Out-Null
-    Copy-Item -Path (Join-Path $s "*") -Destination $d -Recurse -Force
-}
+    This replaces the old Thorium source overlay entirely. Stock Chromium has
+    no use_avx512/use_znver5 GN args and no compiler_opt.gni -- those were
+    Thorium's. apply_zen5_patches.py therefore DEFINES our own declare_args()
+    and wires -march=znver5 -mtune=znver5 into the x64/Windows compiler and
+    ThinLTO-backend flag sites, rather than rewriting somebody else's
+    hardcoded -march=skylake-avx512. See patches/zen5/README.md.
+    #>
+    $marker = Join-Path $BuildDir "patched-chromium-tag.txt"
+    $chromiumTag = if (Test-Path (Join-Path $BuildDir "chromium-tag.txt")) {
+        (Get-Content (Join-Path $BuildDir "chromium-tag.txt") -Raw).Trim()
+    } else { "unknown" }
+    $alreadyFor = if (Test-Path $marker) { (Get-Content $marker -Raw).Trim() } else { $null }
 
-function Invoke-SourceOverlay([string]$Flavor) {
-    $current = if (Test-Path $OverlayMarker) { Get-Content $OverlayMarker -Raw } else { $null }
-    if ($current -eq $Flavor -and -not $Force) {
-        Write-Log "Source overlay already applied for flavor '$Flavor' (use -Force to redo)."
+    if ($alreadyFor -eq $chromiumTag -and -not $Force) {
+        Write-Log "Zen5 patches already applied for Chromium $chromiumTag (use -Force to redo)."
         return
     }
-    Write-Log "Applying '$Flavor' source overlay from Thorium meta-repo onto $SrcDir ..."
 
-    # Mirrors win_scripts/setup.py's thorium_sources list exactly.
-    $overlayDirs = @("ash","build","chrome","chromeos","components","content","extensions",
-                     "google_apis","media","net","sandbox","services","third_party","tools","ui","v8")
-
-    # PRE-FLIGHT: validate every overlay source exists BEFORE copying anything.
-    # Copy-DirOverlay throws on a missing source, but by then earlier dirs are
-    # already copied -- leaving a half-overlaid tree that looks buildable and
-    # isn't. This matters more since sync now checks out a Thorium *release
-    # tag* rather than `main`: a tag's layout is not guaranteed to match, and
-    # the right failure mode is "refuse up front, name what's missing".
-    $required = @((Join-Path $ThoriumMeta "src\BUILD.gn"))
-    foreach ($d in $overlayDirs) { $required += (Join-Path $ThoriumMeta "src\$d") }
-    $required += @(
-        (Join-Path $ThoriumMeta "thorium_shell"),
-        (Join-Path $ThoriumMeta "pak_src\binaries\pak"),
-        (Join-Path $ThoriumMeta "pak_src\binaries\pak-win"),
-        (Join-Path $ThoriumMeta "infra\initial_preferences"),
-        (Join-Path $ThoriumMeta "infra\thor_ver")
+    Write-Log "Applying zen5 patches to stock Chromium $chromiumTag (patches/zen5)."
+    $py = Get-PythonExe
+    Invoke-Logged -Exe $py -Arguments @(
+        (Join-Path $ScriptsDir "apply_zen5_patches.py"),
+        "--src-dir", $SrcDir, "--capture-diffs", "--patches-dir", $PatchesDir
     )
-    if ($Flavor -eq "avx512") {
-        $required += @(
-            (Join-Path $ThoriumMeta "other\AVX2\third_party"),
-            (Join-Path $ThoriumMeta "other\AVX512\thor_ver"),
-            (Join-Path $ThoriumMeta "other\AVX512\thorium_version.txt")
-        )
-    }
-    $missing = $required | Where-Object { -not (Test-Path $_) }
-    if ($missing) {
-        $tagNote = ""
-        $tagMarker = Join-Path $BuildDir "thorium-tag.txt"
-        if (Test-Path $tagMarker) { $tagNote = " (meta-repo is checked out at tag '$((Get-Content $tagMarker -Raw).Trim())')" }
-        throw ("Thorium meta-repo at $ThoriumMeta$tagNote does not have the layout this overlay expects. " +
-               "NOTHING has been copied -- the source tree is untouched. Missing:`n  " +
-               (($missing) -join "`n  ") +
-               "`nIf upstream restructured, update Invoke-SourceOverlay's list against that tag's win_scripts/setup.py.")
-    }
-
-    New-Item -ItemType Directory -Force -Path (Join-Path $SrcDir "out\thorium") | Out-Null
-    Copy-Item (Join-Path $ThoriumMeta "src\BUILD.gn") $SrcDir -Force
-    foreach ($d in $overlayDirs) {
-        Copy-DirOverlay "src\$d" $d
-    }
-    Copy-DirOverlay "thorium_shell" "out\thorium"
-    Copy-Item (Join-Path $ThoriumMeta "pak_src\binaries\pak") (Join-Path $SrcDir "out\thorium") -Force
-    Copy-DirOverlay "pak_src\binaries\pak-win" "out\thorium"
-
-    # Thorium's standard misc/UX/crash-fix patches (win_scripts/setup.py's `patches` list).
-    $patchList = @(
-        "fix-policy-templates.patch","ftp-support-thorium.patch","thorium-2024-ui.patch","GPC.patch",
-        "mini_installer.patch","open_in_same_tab.patch","thorium_webui.patch","disable-privacy-sandbox.patch",
-        "win_updater.patch","keyboard_shortcuts.patch","partalloc.patch","multi-language-translate.patch",
-        "fix_profile_selector_crash.patch","fix_getupdatesprocessor_crash.patch","fix_dangling_pointer_tooltip.patch",
-        "fix_disable_aero_crash.patch","fix_file_dialog_crash.patch","fix_wayland_scale_crash.patch",
-        "restore_download_shelf.patch","fix_absl_undefined_symbol.patch","fix_drag_and_drop_on_wayland.patch",
-        "fix_touch_emulator_double_tap_zoom.patch","fix_setting_popover_invoker_crash.patch"
-    )
-    $appliedCount = 0; $skippedCount = 0
-    foreach ($p in $patchList) {
-        $src = Join-Path $ThoriumMeta "other\$p"
-        if (-not (Test-Path $src)) { Write-Log "  (skip, not present upstream: $p)" "WARN"; $skippedCount++; continue }
-        $check = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "apply", "--check", $src)
-        if ($check.ExitCode -eq 0) {
-            $apply = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "apply", $src)
-            if ($apply.ExitCode -eq 0) {
-                Write-Log "  applied $p"; $appliedCount++
-            } else {
-                # --check passed but apply failed: that's not an "expected skip",
-                # it means the tree changed under us or the patch is half-applied.
-                throw "git apply FAILED for '$p' even though --check passed (exit $($apply.ExitCode)). The tree may now be half-patched -- do not build from it. Detail: $($apply.Output)"
-            }
-        } else {
-            Write-Log "  '$p' does not apply cleanly (already applied, or upstream changed) -- skipping. Detail: $($check.Output)" "WARN"
-            $skippedCount++
-        }
-    }
-    Write-Log "  Thorium misc patches: $appliedCount applied, $skippedCount skipped."
-    # ffmpeg patches (different cwd)
-    $ffmpegDir = Join-Path $SrcDir "third_party\ffmpeg"
-    foreach ($p in @("add-hevc-ffmpeg-decoder-parser.patch", "change-libavcodec-header.patch")) {
-        $ffSrc = Join-Path $ThoriumMeta "other\$p"
-        if (-not (Test-Path $ffSrc)) { Write-Log "  (skip, not present upstream: ffmpeg/$p)" "WARN"; continue }
-        Copy-Item $ffSrc $ffmpegDir -Force
-        $check = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $ffmpegDir, "apply", "--check", $p)
-        if ($check.ExitCode -eq 0) {
-            $apply = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $ffmpegDir, "apply", $p)
-            if ($apply.ExitCode -ne 0) {
-                throw "git apply FAILED for ffmpeg/'$p' even though --check passed (exit $($apply.ExitCode)). Detail: $($apply.Output)"
-            }
-            Write-Log "  applied ffmpeg/$p"
-        }
-        else { Write-Log "  ffmpeg/$p does not apply cleanly -- skipping. Detail: $($check.Output)" "WARN" }
-    }
-
-    Copy-Item (Join-Path $ThoriumMeta "infra\initial_preferences") (Join-Path $SrcDir "out\thorium") -Force
-    Copy-Item (Join-Path $ThoriumMeta "infra\thor_ver") (Join-Path $SrcDir "out\thorium") -Force
-    New-Item -ItemType Directory -Force -Path (Join-Path $SrcDir "out\thorium\default_apps") | Out-Null
-    Copy-Item (Join-Path $ThoriumMeta "infra\default_apps\*") (Join-Path $SrcDir "out\thorium\default_apps") -Recurse -Force -ErrorAction SilentlyContinue
-
-    if ($Flavor -eq "avx512") {
-        Write-Log "  applying AVX-512 flavor third_party overlay (other/AVX2/third_party -- reused by upstream for both AVX2 and AVX-512 flavors)"
-        Copy-DirOverlay "other\AVX2\third_party" "third_party"
-        Copy-Item (Join-Path $ThoriumMeta "other\AVX512\thor_ver") (Join-Path $SrcDir "out\thorium") -Force
-        Copy-Item (Join-Path $ThoriumMeta "other\AVX512\thorium_version.txt") (Join-Path $SrcDir "ui\webui\resources\text") -Force
-
-        Write-Log "  applying zen5 patches (patches/zen5 -- see that directory's README.md)"
-        $py = Get-PythonExe
-        Invoke-Logged -Exe $py -Arguments @(
-            (Join-Path $ScriptsDir "apply_zen5_patches.py"),
-            "--src-dir", $SrcDir, "--capture-diffs", "--patches-dir", $PatchesDir
-        )
-    }
-
-    Set-Content -Path $OverlayMarker -Value $Flavor -NoNewline
-    Write-Log "Source overlay '$Flavor' applied."
+    Set-Content -Path $marker -Value $chromiumTag -NoNewline
+    Write-Log "Zen5 patches applied."
 }
+
 
 function Get-OrDownloadPgoProfile {
     $pgoDir = Join-Path $SrcDir "chrome\build\pgo_profiles"
@@ -567,8 +518,14 @@ function Invoke-Configure {
     Assert-Prereqs
     if (-not (Test-Path $SrcDir)) { throw "No source checkout at $SrcDir. Run '.\build.ps1 sync' first." }
 
-    $flavor = Get-OverlayFlavorForProfile $Profile
-    Invoke-SourceOverlay $flavor
+    # zen5 and generic-avx512 both need our declare_args()/flag sites present
+    # in the tree. baseline is deliberately stock: no patches at all, so it is
+    # a true apples-to-apples comparison point.
+    if ($Profile -eq "baseline") {
+        Write-Log "Profile 'baseline' -- leaving the Chromium tree completely unpatched (that is the point of this profile)."
+    } else {
+        Invoke-Zen5Patches
+    }
 
     $pgoPath = Get-OrDownloadPgoProfile
     $pgoPathGn = $pgoPath -replace '\\', '/'
@@ -578,24 +535,49 @@ function Invoke-Configure {
         "zen5"            { Join-Path $GnDir "win_zen5_args.gn" }
         "generic-avx512"  { Join-Path $GnDir "win_generic_avx512_args.gn" }
     }
+    $commonSrc = Join-Path $GnDir "_common_args.gni.txt"
+    if (-not (Test-Path $commonSrc)) { throw "Missing $commonSrc -- every profile shares this block." }
+
     $outDir = Join-Path $SrcDir "out\thorium-$Profile"
     New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 
-    (Get-Content $argsSrc -Raw) -replace '__PGO_DATA_PATH__', $pgoPathGn |
-        Set-Content -Path (Join-Path $outDir "args.gn") -NoNewline
+    # The three profiles MUST differ only in their CPU-targeting lines, or the
+    # comparison between them is meaningless -- so the shared block is
+    # concatenated rather than duplicated per profile.
+    $argsText = (Get-Content $commonSrc -Raw) + "`n" + (Get-Content $argsSrc -Raw)
+    # Plain string Replace, NOT -replace: the latter treats the replacement as
+    # a regex substitution where '$' is special, so a path containing one would
+    # be silently mangled.
+    $argsText = $argsText.Replace('__PGO_DATA_PATH__', $pgoPathGn)
+    Set-Content -Path (Join-Path $outDir "args.gn") -Value $argsText -NoNewline
 
-    Write-Log "Wrote $(Join-Path $outDir 'args.gn') from $argsSrc"
+    Write-Log "Wrote $(Join-Path $outDir 'args.gn') from $commonSrc + $argsSrc"
 
-    if ($Profile -ne "baseline") {
-        $verify = Select-String -Path (Join-Path $outDir "args.gn") -Pattern "use_znver5" -Quiet
-        if ($Profile -eq "zen5" -and -not $verify) {
-            throw "gn/win_zen5_args.gn does not set use_znver5 -- configuration error."
-        }
+    if ($Profile -eq "zen5") {
+        $verify = Select-String -Path (Join-Path $outDir "args.gn") -Pattern "^\s*use_znver5\s*=\s*true" -Quiet
+        if (-not $verify) { throw "gn/win_zen5_args.gn does not set use_znver5 = true -- configuration error." }
     }
 
     $env = Get-DepotToolsEnv
     Write-Log "Running gn gen out\thorium-$Profile"
-    Invoke-Logged -Exe (Join-Path $DepotTools "gn.bat") -Arguments @("gen", "out\thorium-$Profile") -WorkingDirectory $SrcDir -EnvVars $env
+    # Tolerate exit 1 so a bad arg can be diagnosed properly below instead of
+    # surfacing as gn's one-unknown-arg-at-a-time error.
+    Invoke-Logged -Exe (Join-Path $DepotTools "gn.bat") -Arguments @("gen", "out\thorium-$Profile") `
+        -WorkingDirectory $SrcDir -EnvVars $env -AllowedExitCodes @(0, 1)
+    $genOutput = $script:LastCommandTail
+    if ($genOutput -match "Unknown build argument") {
+        Write-Log "gn rejected an argument -- checking ALL of ours against this Chromium's real arg list." "WARN"
+        $unknown = Get-UnknownGnArgs -ArgsGnPath (Join-Path $outDir "args.gn") -OutDirRelative "out\thorium-$Profile"
+        if ($unknown.Count -gt 0) {
+            throw ("args.gn contains argument(s) that do not exist in Chromium $(Get-PinnedChromiumTag):`n  " +
+                   ($unknown -join "`n  ") +
+                   "`nThese are most likely Thorium-only args. Remove them from gn\*.gn, or add them via patches/zen5 if they are meant to be ours.")
+        }
+        throw "gn gen failed with an unknown build argument, but every arg in args.gn matched gn's list -- see $script:LogFile"
+    }
+    if (-not (Test-Path (Join-Path $outDir "build.ninja"))) {
+        throw "gn gen did not produce build.ninja in $outDir -- see $script:LogFile"
+    }
 
     # Re-audit now that the tree is patched/configured, so build/audit.json
     # reflects what will actually be built, not just what was synced.
@@ -632,14 +614,18 @@ function Invoke-Build {
     }
     $env = Get-DepotToolsEnv
     $jobs = Get-JobCount
-    Write-Log "Building profile '$Profile' with $jobs jobs (autoninja thorium_all + thorium_installer)."
+    # Stock Chromium targets. `thorium_all`/`thorium_installer` were Thorium's
+    # own GN targets and do not exist here -- ninja would fail with "unknown
+    # target". `chrome` builds the browser; `mini_installer` produces the
+    # self-extracting installer our Inno Setup step unpacks.
+    Write-Log "Building profile '$Profile' with $jobs jobs (autoninja chrome + mini_installer)."
 
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") `
-        -Arguments @("-C", "out\thorium-$Profile", "thorium_all", "-j$jobs") `
+        -Arguments @("-C", "out\thorium-$Profile", "chrome", "-j$jobs") `
         -WorkingDirectory $SrcDir -EnvVars $env
 
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") `
-        -Arguments @("-C", "out\thorium-$Profile", "thorium_installer", "-j$jobs") `
+        -Arguments @("-C", "out\thorium-$Profile", "mini_installer", "-j$jobs") `
         -WorkingDirectory $SrcDir -EnvVars $env
 
     $py = Get-PythonExe

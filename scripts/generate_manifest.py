@@ -60,7 +60,6 @@ def main():
     repo_root = Path(args.repo_root)
     src_dir = repo_root / "src"
     out_dir = src_dir / "out" / f"thorium-{args.profile}"
-    thorium_meta_dir = repo_root / "upstream" / "Thorium"
 
     manifest = {
         "manifest_schema_version": 1,
@@ -70,7 +69,8 @@ def main():
         "source_revisions": {
             "chromium_src_commit": sh("git rev-parse HEAD", cwd=str(src_dir)),
             "chromium_src_commit_date": sh("git log -1 --format=%cI", cwd=str(src_dir)),
-            "thorium_meta_repo_commit": sh("git rev-parse HEAD", cwd=str(thorium_meta_dir)),
+            "chromium_tag": (repo_root / "build" / "chromium-tag.txt").read_text().strip()
+            if (repo_root / "build" / "chromium-tag.txt").exists() else None,
             "thorium_zen5_repo_commit": sh("git rev-parse HEAD", cwd=str(repo_root)),
         },
         "compiler": {

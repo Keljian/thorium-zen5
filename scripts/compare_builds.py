@@ -72,9 +72,8 @@ def collect(repo_root: Path, profile: str, build_root: Path) -> dict:
         "isa_report_available": isa_report is not None,
         "build_manifest_available": manifest is not None,
         "compiler_flags_summary": {
-            "use_avx2": args_gn.get("use_avx2"),
-            "use_avx512": args_gn.get("use_avx512"),
             "use_znver5": args_gn.get("use_znver5"),
+            "use_generic_avx512": args_gn.get("use_generic_avx512"),
             "use_thin_lto": args_gn.get("use_thin_lto"),
             "chrome_pgo_phase": args_gn.get("chrome_pgo_phase"),
         },

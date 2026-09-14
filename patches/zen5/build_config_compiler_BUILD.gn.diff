@@ -1,0 +1,58 @@
+--- a/build/config/compiler/BUILD.gn
++++ b/build/config/compiler/BUILD.gn
+@@ -324,6 +324,25 @@
+ # See also "runtime_library" below for related stuff and a discussion about
+ # where stuff should go. Put warning related stuff in the "warnings" config.
+ 
++# --- thorium-zen5: Zen 5 CPU targeting (declare_args) ---
++# Added by thorium-zen5. Stock Chromium has no microarchitecture-targeting
++# argument; these are ours. Both default to false so an unpatched-intent
++# build (the "baseline" profile) is byte-for-byte stock behaviour.
++declare_args() {
++  # Target AMD Zen 5 (Ryzen 9 9950X and family) specifically: lets Clang's
++  # own znver5 model select the complete ISA -- including AVX512VNNI, VBMI,
++  # VBMI2, BITALG, VPOPCNTDQ, IFMA, BF16, GFNI, VAES, VPCLMULQDQ -- and Zen 5
++  # scheduling, instead of a hand-maintained feature flag list.
++  # A binary built with this WILL fault on any pre-Zen5 CPU. That is intended;
++  # backward compatibility is explicitly not a goal of this project.
++  use_znver5 = false
++
++  # Vendor-neutral AVX-512 (the F/CD/VL/BW/DQ subset common to all AVX-512
++  # parts, with generic AVX-512 scheduling). Exists purely as the comparison
++  # point for use_znver5 in scripts/compare_builds.py.
++  use_generic_avx512 = false
++}
++
+ config("compiler") {
+   asmflags = []
+   cflags = []
+@@ -336,6 +355,29 @@
+   ldflags = []
+   defines = []
+   configs = []
++
++  # --- thorium-zen5: Zen 5 CPU targeting ---
++  # Applied to x64 Windows clang target builds only. Left out of the host
++  # toolchain and any non-x64 toolchain on purpose: those build tools that
++  # must run on the build machine and on other architectures, and must not
++  # inherit a Zen 5 target.
++  if (is_win && current_cpu == "x64" && is_clang && is_a_target_toolchain) {
++    assert(!(use_znver5 && use_generic_avx512),
++           "use_znver5 and use_generic_avx512 are mutually exclusive -- " +
++           "pick one; they set conflicting -march values.")
++    if (use_znver5) {
++      cflags += [
++        "-march=znver5",
++        "-mtune=znver5",
++      ]
++    } else if (use_generic_avx512) {
++      cflags += [
++        "-march=skylake-avx512",
++        "-mtune=skylake-avx512",
++      ]
++    }
++  }
++  # --- end thorium-zen5: Zen 5 CPU targeting ---
+ 
+   # System-specific flags. If your compiler flags apply to one of the
+   # categories here, add it to the associated file to keep this shared config

@@ -25,17 +25,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Files inside the Chromium checkout (after Thorium's setup.py overlay has
-# copied Thorium's own build/ tree on top) that are known, from direct
-# inspection of the Thorium meta-repo, to reference use_avx512. This list is
-# the starting point for the grep pass below; the pass also searches the
-# rest of the tree so newly-introduced references are not missed silently.
-KNOWN_AVX512_FILES = [
-    "build/config/compiler_opt.gni",
+# Files in the STOCK Chromium checkout that this project's zen5 patches
+# add CPU-targeting flags to. Stock Chromium has no microarchitecture arg of
+# its own (and no compiler_opt.gni -- that was Thorium's), so these are the
+# sites apply_zen5_patches.py edits. The grep pass below also searches the
+# rest of the tree so a newly-introduced reference is not missed silently.
+KNOWN_TARGETING_FILES = [
     "build/config/compiler/BUILD.gn",
     "build/config/win/BUILD.gn",
     "v8/BUILD.gn",
-    "chrome/installer/linux/BUILD.gn",
 ]
 
 # Third-party components that are documented (upstream Chromium architecture)
@@ -146,8 +144,8 @@ def audit(repo_root: Path) -> dict:
     depot_tools_dir = repo_root / "depot_tools"
     clang_info = get_clang_version(depot_tools_dir, src_dir)
 
-    avx512_files = grep_tree(src_dir, r"use_avx512", ["build/config/**/*.gn", "build/config/**/*.gni",
-                                                        "v8/BUILD.gn", "chrome/**/*.gn"])
+    avx512_files = grep_tree(src_dir, r"use_generic_avx512", ["build/config/**/*.gn", "build/config/**/*.gni",
+                                                        "v8/BUILD.gn"])
     znver5_files = grep_tree(src_dir, r"use_znver5|znver5", ["build/config/**/*.gn", "build/config/**/*.gni",
                                                                "v8/BUILD.gn"])
 
@@ -178,7 +176,9 @@ def audit(repo_root: Path) -> dict:
         "generated_at": now,
         "status": "OK",
         "chromium_version": chromium_version,
-        "thorium_meta_repo_commit": sh("git rev-parse HEAD", cwd=str(repo_root / "upstream" / "Thorium")).stdout.strip() or None,
+        "chromium_tag": (repo_root / "build" / "chromium-tag.txt").read_text().strip()
+        if (repo_root / "build" / "chromium-tag.txt").exists() else None,
+        "chromium_src_commit": sh("git rev-parse HEAD", cwd=str(src_dir)).stdout.strip() or None,
         "compiler": clang_info,
         "target_cpu": current_args.get("target_cpu"),
         "target_os": current_args.get("target_os"),
@@ -186,10 +186,10 @@ def audit(repo_root: Path) -> dict:
         "pgo_enabled": current_args.get("chrome_pgo_phase") not in (None, "0"),
         "pgo_data_path": current_args.get("pgo_data_path"),
         "lto_enabled": current_args.get("use_thin_lto") == "true",
-        "avx512_enabled": current_args.get("use_avx512") == "true",
+        "avx512_enabled": current_args.get("use_generic_avx512") == "true",
         "znver5_enabled": current_args.get("use_znver5") == "true",
         "affected_targets": {
-            "files_referencing_use_avx512": avx512_files,
+            "files_referencing_use_generic_avx512": avx512_files,
             "files_referencing_use_znver5": znver5_files,
         },
         "third_party_dispatch_survey": runtime_dispatch_findings,

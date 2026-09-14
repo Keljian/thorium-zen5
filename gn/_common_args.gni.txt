@@ -1,0 +1,63 @@
+# Shared arg block for all thorium-zen5 profiles, STOCK CHROMIUM.
+#
+# This file is not used by GN directly -- build.ps1 concatenates it with a
+# per-profile SIMD block to produce out/thorium-<profile>/args.gn. It exists
+# so the three comparison profiles differ ONLY in their CPU-targeting lines;
+# anything else differing between them would invalidate the comparison.
+#
+# Every arg here must exist in stock Chromium. Thorium's own args
+# (use_sse3/41/42, use_avx, use_avx2, use_avx512, use_fma) are NOT stock and
+# were removed when this project stopped overlaying Thorium -- `gn gen` hard
+# -errors on an unknown build argument, so leaving them in would break the
+# build outright. build.ps1 configure validates this list against
+# `gn args --list` before generating, and names every unknown arg at once.
+#
+# SECURITY: nothing here weakens Chromium's hardening. The sandbox, CFG
+# (win_enable_cfg_guards), DEP/ASLR defaults, certificate validation and
+# update-signature checks are all left at their stock values, per the
+# project's standing requirement. Do not add args that relax them.
+
+target_os = "win"
+target_cpu = "x64"
+
+# Official-grade optimization (full LTO + PGO + no debug scaffolding).
+is_official_build = true
+is_debug = false
+is_component_build = false
+dcheck_always_on = false
+enable_iterator_debugging = false
+exclude_unwind_tables = true
+symbol_level = 0
+blink_symbol_level = 0
+v8_symbol_level = 0
+
+# Toolchain
+is_clang = true
+use_lld = true
+clang_use_chrome_plugins = true
+treat_warnings_as_errors = false
+
+# Keep Control Flow Guard on. Do not set this false.
+win_enable_cfg_guards = true
+
+# LTO + PGO. pgo_data_path is substituted by build.ps1 configure with the
+# real path to Chromium's official win64 profile (generic, NOT Zen5-trained
+# -- see docs/BUILD.md "About PGO").
+use_thin_lto = true
+thin_lto_enable_optimizations = true
+chrome_pgo_phase = 2
+pgo_data_path = "__PGO_DATA_PATH__"
+
+# Media / codecs
+proprietary_codecs = true
+ffmpeg_branding = "Chrome"
+media_use_ffmpeg = true
+media_use_libvpx = true
+enable_platform_hevc = true
+enable_widevine = true
+
+# Trim things a personal build does not need.
+enable_nacl = false
+disable_fieldtrial_testing_config = true
+optimize_webui = true
+enable_rust = true

@@ -2,7 +2,7 @@
 """
 analyze_isa.py -- Phase 4 tool: disassemble a built binary and report actual
 AVX-512 (and other Zen5-relevant) instruction usage. Never assumes the
-compiler emitted AVX-512 just because -march=znver5/use_avx512 was passed;
+compiler emitted AVX-512 just because -march=znver5/use_generic_avx512 was passed;
 it inspects the real machine code with llvm-objdump.
 
 Usage:
