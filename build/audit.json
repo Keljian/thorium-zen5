@@ -1,6 +1,6 @@
 {
   "audit_schema_version": 1,
-  "generated_at": "2026-09-14T22:31:20.470676+00:00",
+  "generated_at": "2026-09-14T22:35:22.319132+00:00",
   "status": "OK",
   "chromium_version": "154.0.8037.17",
   "chromium_tag": "154.0.8037.17",
@@ -47,10 +47,10 @@
       "exists": true,
       "runtime_dispatch_signature_found_in": [
         "third_party\\dav1d\\libdav1d\\src\\cpu.c",
-        "third_party\\dav1d\\libdav1d\\src\\arm\\cpu.c",
-        "third_party\\dav1d\\libdav1d\\src\\loongarch\\cpu.c",
-        "third_party\\dav1d\\libdav1d\\src\\ppc\\cpu.c",
-        "third_party\\dav1d\\libdav1d\\src\\riscv\\cpu.c"
+        "third_party\\dav1d\\libdav1d\\src\\cpu.h",
+        "third_party\\dav1d\\libdav1d\\src\\x86\\cpu.c",
+        "third_party\\dav1d\\libdav1d\\src\\x86\\cdef.h",
+        "third_party\\dav1d\\libdav1d\\src\\x86\\cpu.h"
       ],
       "is_runtime_dispatched": true,
       "scan_truncated": false,
@@ -59,11 +59,11 @@
     "third_party/libjpeg_turbo": {
       "exists": true,
       "runtime_dispatch_signature_found_in": [
+        "third_party\\libjpeg_turbo\\simd\\jsimd.h",
+        "third_party\\libjpeg_turbo\\simd\\x86_64\\jsimd.c",
         "third_party\\libjpeg_turbo\\simd\\arm\\aarch32\\jsimd.c",
         "third_party\\libjpeg_turbo\\simd\\arm\\aarch64\\jsimd.c",
-        "third_party\\libjpeg_turbo\\simd\\i386\\jsimd.c",
-        "third_party\\libjpeg_turbo\\simd\\x86_64\\jsimd.c",
-        "third_party\\libjpeg_turbo\\src\\jccolor.c"
+        "third_party\\libjpeg_turbo\\simd\\i386\\jsimd.c"
       ],
       "is_runtime_dispatched": true,
       "scan_truncated": false,
@@ -71,9 +71,15 @@
     },
     "third_party/skia": {
       "exists": true,
-      "runtime_dispatch_signature_found_in": [],
-      "is_runtime_dispatched": null,
-      "scan_truncated": true,
+      "runtime_dispatch_signature_found_in": [
+        "third_party\\skia\\src\\core\\SkBitmapProcState_opts.cpp",
+        "third_party\\skia\\src\\core\\SkBlitMask_opts.cpp",
+        "third_party\\skia\\src\\core\\SkBlitRow_opts.cpp",
+        "third_party\\skia\\src\\core\\SkCpu.cpp",
+        "third_party\\skia\\src\\core\\SkGraphics.cpp"
+      ],
+      "is_runtime_dispatched": true,
+      "scan_truncated": false,
       "scan_file_limit": 400
     },
     "third_party/zlib": {
@@ -93,7 +99,5 @@
   "modified_files": [
     "build\\config\\compiler\\BUILD.gn"
   ],
-  "unresolved_questions": [
-    "third_party/skia: bounded scan (first 400 files) found no runtime-dispatch signature. This is NOT proof of absence -- re-run `audit --deep` to scan exhaustively."
-  ]
+  "unresolved_questions": []
 }

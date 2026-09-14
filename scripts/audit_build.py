@@ -40,12 +40,24 @@ KNOWN_TARGETING_FILES = [
 # to use *runtime* CPU dispatch rather than build-time -march specialization.
 # Verified per-checkout below by checking each path exists and, where
 # feasible, grepping for a runtime dispatch signature (cpu detection call).
+# Each entry: signature regex, plus the subdirectories most likely to contain
+# it, searched FIRST. Without the hints a bounded scan can miss a signature
+# that is genuinely present and report a misleading "inconclusive": measured on
+# Chromium 154, third_party/skia matched SkCpu in 75 files and ships the
+# per-target dispatch machinery in src/opts (SkOpts_SetTarget.h /
+# SkOpts_RestoreTarget.h), but none of it fell inside the first 400 files of a
+# blind third_party/skia/**/*.cc walk.
 RUNTIME_DISPATCHED_CANDIDATES = {
-    "third_party/highway": r"HWY_TARGETS|SupportedTargets",
-    "third_party/dav1d": r"dav1d_get_cpu_flags|has_cpuid",
-    "third_party/libjpeg_turbo": r"jsimd_can_|jpeg_simd_cpu_support",
-    "third_party/skia": r"SkCpu|SkOpts::Init",
-    "third_party/zlib": r"cpu_features|x86_cpu_enable",
+    "third_party/highway":      {"sig": r"HWY_TARGETS|SupportedTargets",
+                                 "hints": ["hwy", "hwy/ops"]},
+    "third_party/dav1d":        {"sig": r"dav1d_get_cpu_flags|has_cpuid",
+                                 "hints": ["libdav1d/src", "libdav1d/src/x86"]},
+    "third_party/libjpeg_turbo":{"sig": r"jsimd_can_|jpeg_simd_cpu_support",
+                                 "hints": ["simd", "simd/x86_64"]},
+    "third_party/skia":         {"sig": r"SkCpu|SkOpts::Init",
+                                 "hints": ["src/opts", "src/core"]},
+    "third_party/zlib":         {"sig": r"cpu_features|x86_cpu_enable",
+                                 "hints": [".", "contrib"]},
 }
 
 
@@ -172,15 +184,21 @@ def audit(repo_root: Path, deep: bool = False) -> dict:
                                 ["build/config/**/*.gn", "build/config/**/*.gni", "v8/BUILD.gn"])
 
     runtime_dispatch_findings = {}
-    for rel, sig in RUNTIME_DISPATCHED_CANDIDATES.items():
+    for rel, spec in RUNTIME_DISPATCHED_CANDIDATES.items():
+        sig = spec["sig"]
         d = src_dir / rel
         if not d.exists():
             runtime_dispatch_findings[rel] = {"exists": False}
             continue
         scan_limit = None if deep else 400
+        # Hinted subdirectories first, then the whole subtree as a fallback.
+        globs = []
+        for hint in spec.get("hints", []):
+            base = f"{rel}/{hint}".rstrip("/.").rstrip("/")
+            globs += [f"{base}/*.cpp", f"{base}/*.cc", f"{base}/*.c", f"{base}/*.h"]
+        globs += [f"{rel}/**/*.cpp", f"{rel}/**/*.cc", f"{rel}/**/*.c", f"{rel}/**/*.h"]
         matched_files, truncated = grep_tree(
-            src_dir, sig, [f"{rel}/**/*.cc", f"{rel}/**/*.c", f"{rel}/**/*.h"],
-            max_hits=5, max_files=scan_limit)
+            src_dir, sig, globs, max_hits=5, max_files=scan_limit)
         runtime_dispatch_findings[rel] = {
             "exists": True,
             "runtime_dispatch_signature_found_in": matched_files,
