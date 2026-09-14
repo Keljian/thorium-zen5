@@ -221,6 +221,35 @@ function Invoke-Logged {
     $script:LastCommandTail = ($tail -join "`n")
 }
 
+function Resolve-ThoriumLatestStableTag {
+    <#
+    Returns the tag name of Thorium's current latest STABLE (non-prerelease,
+    non-draft) GitHub release. We deliberately do NOT track the `main`
+    branch: Alex313031/Thorium's own version-specific work (patches, GN
+    args, win_scripts) lives on per-version branches (e.g. M150, M144) that
+    get tagged releases roughly every 3-4 weeks, while `main` itself can go
+    stale for months at a time (verified: main's last commit was 2026-05-08
+    while M151 shipped 2026-08-03 and M152(beta) 2026-08-23 from other
+    branches). GitHub's /releases/latest endpoint already excludes
+    prereleases/drafts by definition, so this always resolves to the
+    newest tagged release Thorium's maintainers consider stable -- not the
+    newest beta, and not whatever main happens to contain.
+    #>
+    $uri = "https://api.github.com/repos/Alex313031/Thorium/releases/latest"
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers @{ "User-Agent" = "thorium-zen5-build.ps1" } -UseBasicParsing
+    } catch {
+        throw "Failed to resolve Thorium's latest stable release from $uri -- check network access and GitHub API rate limits (unauthenticated: 60 req/hr): $_"
+    }
+    if (-not $resp.tag_name) {
+        throw "GitHub's releases/latest response for Alex313031/Thorium had no tag_name field: $($resp | ConvertTo-Json -Compress -Depth 3)"
+    }
+    if ($resp.prerelease) {
+        Write-Log "WARNING: GitHub returned a prerelease as Thorium's 'latest' ($($resp.tag_name)) -- using it anyway since the API is the source of truth here." "WARN"
+    }
+    return [string]$resp.tag_name
+}
+
 function Get-JobCount {
     if ($Jobs -gt 0) { return $Jobs }
     return (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
@@ -289,11 +318,24 @@ function Invoke-Sync {
     Write-Log "Running gclient runhooks (pulls pinned clang/Windows toolchain files)."
     Invoke-Logged -Exe (Join-Path $DepotTools "gclient.bat") -Arguments @("runhooks") -WorkingDirectory $SrcDir -EnvVars $env
 
-    Write-Log "Pulling latest Thorium meta-repo."
-    if (Test-Path (Join-Path $ThoriumMeta ".git")) {
-        Invoke-Logged -Exe "git" -Arguments @("pull", "--ff-only") -WorkingDirectory $ThoriumMeta
+    Write-Log "Resolving Thorium's latest stable (non-prerelease) release tag from GitHub..."
+    $targetTag = Resolve-ThoriumLatestStableTag
+    Write-Log "Target Thorium meta-repo tag: $targetTag"
+    $tagMarkerFile = Join-Path $BuildDir "thorium-tag.txt"
+    $currentTag = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
+
+    if (-not (Test-Path (Join-Path $ThoriumMeta ".git"))) {
+        Write-Log "No existing Thorium meta-repo checkout -- cloning tag '$targetTag'."
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $ThoriumMeta) | Out-Null
+        Invoke-Logged -Exe "git" -Arguments @("clone", "--depth", "1", "--branch", $targetTag, "https://github.com/Alex313031/Thorium.git", $ThoriumMeta)
+        Set-Content -Path $tagMarkerFile -Value $targetTag
+    } elseif ($currentTag -ne $targetTag) {
+        Write-Log "Thorium meta-repo is at '$currentTag' -- updating to newer stable tag '$targetTag'."
+        Invoke-Logged -Exe "git" -Arguments @("fetch", "--depth", "1", "origin", "refs/tags/${targetTag}:refs/tags/${targetTag}") -WorkingDirectory $ThoriumMeta
+        Invoke-Logged -Exe "git" -Arguments @("checkout", "--force", $targetTag) -WorkingDirectory $ThoriumMeta
+        Set-Content -Path $tagMarkerFile -Value $targetTag
     } else {
-        Invoke-Logged -Exe "git" -Arguments @("clone", "--depth", "1", "https://github.com/Alex313031/Thorium.git", $ThoriumMeta)
+        Write-Log "Thorium meta-repo already at latest stable tag '$targetTag' -- nothing to do."
     }
 
     Write-Log "Sync complete."
