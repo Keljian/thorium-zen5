@@ -79,15 +79,20 @@ def run_speedometer_benchmark(binary: Path, speedometer_dir: Path) -> dict:
         return {"kind": "speedometer3", "skipped": True,
                 "reason": f"{index} not found -- see docs/BENCHMARKS.md to fetch Speedometer 3.0 locally"}
     with tempfile.TemporaryDirectory() as tmp:
-        dump_path = Path(tmp) / "dump.html"
         cmd = [
             str(binary), "--headless=new", "--disable-gpu",
-            f"--user-data-dir={tmp}\\profile",
+            f"--user-data-dir={Path(tmp) / 'profile'}",
             "--virtual-time-budget=180000",
-            f"--dump-dom", f"file:///{index.as_posix()}",
+            "--dump-dom", f"file:///{index.as_posix()}",
         ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
-        dump_path.write_text(r.stdout, errors="ignore")
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+        except subprocess.TimeoutExpired:
+            # Must not propagate: an unhandled exception here aborts the whole
+            # update.ps1 pipeline at the benchmark stage. A benchmark that
+            # could not run is reported as skipped, per this file's contract.
+            return {"kind": "speedometer3", "skipped": True,
+                    "reason": "timed out after 240s -- Speedometer did not finish headlessly"}
         m = re.search(r'id="result-number"[^>]*>([\d.]+)', r.stdout)
         if not m:
             return {"kind": "speedometer3", "skipped": True,

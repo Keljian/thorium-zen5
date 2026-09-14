@@ -40,6 +40,26 @@ $warnings = New-Object System.Collections.Generic.List[string]
 function Add-Err([string]$m) { $errors.Add($m); Write-Host "ERROR: $m" -ForegroundColor Red }
 function Add-Warn([string]$m) { $warnings.Add($m); Write-Host "WARN: $m" -ForegroundColor Yellow }
 
+function Invoke-NativeCapture {
+    <#
+    Run a native command, returning exit code + combined output, WITHOUT
+    throwing. With $ErrorActionPreference = "Stop", `& git ... 2>&1` promotes
+    anything the command writes to stderr into a TERMINATING error -- so
+    `git fsck` on the Chromium checkout (which legitimately reports dangling
+    objects on stderr, exactly the case the caller below wants to warn about
+    rather than die on) would kill this script instead. $ErrorActionPreference
+    is function-scoped here, so it reverts on return.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+    $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = 0
+    $output = & $Exe @Arguments 2>&1 | ForEach-Object { $_.ToString() }
+    return [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Output = (@($output) -join "`n") }
+}
+
 $result = [ordered]@{
     status = "unknown"
     checked_at_utc = (Get-Date).ToUniversalTime().ToString("o")
@@ -58,21 +78,23 @@ $result = [ordered]@{
 if (-not (Test-Path (Join-Path $RepoRoot ".git"))) {
     Add-Err "thorium-zen5 repo root ($RepoRoot) is not a git repository."
 } else {
-    $fsck = & git -C $RepoRoot fsck --no-progress 2>&1
-    if ($LASTEXITCODE -ne 0) { Add-Err "git fsck failed on $RepoRoot : $fsck" }
-    $result.source_revision = (& git -C $RepoRoot rev-parse HEAD 2>$null)
+    $fsck = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $RepoRoot, "fsck", "--no-progress")
+    if ($fsck.ExitCode -ne 0) { Add-Err "git fsck failed on $RepoRoot : $($fsck.Output)" }
+    $rev = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $RepoRoot, "rev-parse", "HEAD")
+    $result.source_revision = if ($rev.ExitCode -eq 0) { $rev.Output.Trim() } else { $null }
 }
 
 if (Test-Path (Join-Path $SrcDir ".git")) {
-    $fsckSrc = & git -C $SrcDir fsck --no-progress 2>&1
-    if ($LASTEXITCODE -ne 0) { Add-Warn "git fsck reported issues on the Chromium checkout (large repos sometimes warn on dangling blobs from gclient churn -- review manually): $fsckSrc" }
+    $fsckSrc = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "fsck", "--no-progress")
+    if ($fsckSrc.ExitCode -ne 0) { Add-Warn "git fsck reported issues on the Chromium checkout (large repos sometimes warn on dangling blobs from gclient churn -- review manually): $($fsckSrc.Output)" }
 } else {
     Add-Warn "No Chromium checkout at $SrcDir yet -- skipping source-tree checks (run build.ps1 sync first)."
 }
 
 # 2. Expected upstream revision (Thorium meta-repo)
 if (Test-Path (Join-Path $ThoriumMeta ".git")) {
-    $result.upstream_revision = (& git -C $ThoriumMeta rev-parse HEAD 2>$null)
+    $upRev = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $ThoriumMeta, "rev-parse", "HEAD")
+    $result.upstream_revision = if ($upRev.ExitCode -eq 0) { $upRev.Output.Trim() } else { $null }
 } else {
     Add-Warn "Thorium meta-repo not present at $ThoriumMeta."
 }

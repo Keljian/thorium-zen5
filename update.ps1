@@ -48,15 +48,34 @@ function Log([string]$m, [string]$lvl = "INFO") {
 
 Log "=== update.ps1 starting (profile=$Profile, CheckOnly=$CheckOnly) ==="
 
-# 1. Detect new Thorium version
+function Resolve-ThoriumLatestStableTag {
+    # Kept in sync with the identical function in build.ps1 -- see the long
+    # comment there for why we track the latest stable RELEASE TAG and not the
+    # `main` branch (main goes stale for months while per-version branches ship).
+    $uri = "https://api.github.com/repos/Alex313031/Thorium/releases/latest"
+    try {
+        $resp = Invoke-RestMethod -Uri $uri -Headers @{ "User-Agent" = "thorium-zen5-update.ps1" } -UseBasicParsing
+    } catch {
+        throw "Failed to resolve Thorium's latest stable release from $uri -- check network / GitHub rate limits: $_"
+    }
+    if (-not $resp.tag_name) { throw "GitHub releases/latest returned no tag_name for Alex313031/Thorium." }
+    return [string]$resp.tag_name
+}
+
+# 1. Detect new Thorium version.
+#    build.ps1 sync checks the meta-repo out at a release TAG (detached HEAD,
+#    shallow) and records it in build/thorium-tag.txt. So the meaningful
+#    comparison is "tag we last synced" vs "latest stable tag upstream" --
+#    NOT HEAD vs origin/main, which on a `--depth 1 --branch <tag>` clone has
+#    no origin/main ref to resolve at all.
 if (-not (Test-Path (Join-Path $ThoriumMeta ".git"))) {
     throw "Thorium meta-repo not found at $ThoriumMeta. Run '.\build.ps1 sync' at least once first."
 }
-$localRev = & git -C $ThoriumMeta rev-parse HEAD
-& git -C $ThoriumMeta fetch origin main --quiet
-$remoteRev = & git -C $ThoriumMeta rev-parse origin/main
-$thoriumChanged = ($localRev -ne $remoteRev)
-Log "Thorium meta-repo: local=$localRev remote=$remoteRev changed=$thoriumChanged"
+$tagMarkerFile = Join-Path $BuildDir "thorium-tag.txt"
+$localTag = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
+$latestTag = Resolve-ThoriumLatestStableTag
+$thoriumChanged = ($localTag -ne $latestTag)
+Log "Thorium meta-repo: synced-tag=$localTag latest-stable-tag=$latestTag changed=$thoriumChanged"
 
 # 2. Detect Chromium version changes (compare src/chrome/VERSION to what's recorded
 #    in the last build manifest, if any -- a lightweight local check that does not
@@ -65,26 +84,42 @@ $chromiumChanged = $true
 $lastManifest = Join-Path $BuildDir "build-manifest-$Profile.json"
 if ((Test-Path $lastManifest) -and (Test-Path (Join-Path $SrcDir "chrome\VERSION"))) {
     $lastCommit = (Get-Content $lastManifest -Raw | ConvertFrom-Json).source_revisions.chromium_src_commit
-    $currentCommit = & git -C $SrcDir rev-parse origin/main 2>$null
+    $ErrorActionPreference = "Continue"   # native stderr must not be terminating here
+    $currentCommit = (& git -C $SrcDir rev-parse origin/main 2>$null | Select-Object -First 1)
+    $ErrorActionPreference = "Stop"
     $chromiumChanged = ($lastCommit -ne $currentCommit)
-    Log "Chromium: last-built=$lastCommit current-origin-main=$currentCommit changed=$chromiumChanged"
+    # Honest about what this does and doesn't tell us: origin/main here is
+    # whatever the LAST sync fetched, not live upstream (we deliberately don't
+    # fetch ~30GB just to poll). So this detects "we built older than what we
+    # already have on disk"; genuinely new upstream Chromium arrives via the
+    # Thorium tag bump above, which is what actually pins the Chromium version.
+    Log "Chromium: last-built=$lastCommit last-fetched-origin/main=$currentCommit changed=$chromiumChanged"
 } else {
     Log "No prior build-manifest for profile '$Profile' -- treating as changed (first build)."
 }
 
 # 3. Relevant Thorium build-system changes: did any of the files our zen5
-#    patches touch change shape upstream since we last patched?
+#    patches touch change shape upstream?
+#
+#    This used to `git diff $localRev $remoteRev -- <path>`, which cannot work
+#    now: the meta-repo is a --depth 1 tag checkout, so both revisions are not
+#    present locally to diff, and the pathspecs were written with backslashes
+#    which git does not match against its forward-slash index anyway -- so the
+#    check silently reported "no change" every time.
+#
+#    A tag bump is itself the signal that the patch targets may have moved.
+#    We don't guess: apply_zen5_patches.py verifies each insertion marker and
+#    fails loudly (exit 3) if one is gone, and stage 5 below treats that as a
+#    hard stop. So flag the risk, and let the patcher be the authority.
 $watchedFiles = @(
-    "src\build\config\compiler_opt.gni", "src\build\config\compiler\BUILD.gn",
-    "src\build\config\win\BUILD.gn", "src\v8\BUILD.gn"
+    "src/build/config/compiler_opt.gni", "src/build/config/compiler/BUILD.gn",
+    "src/build/config/win/BUILD.gn", "src/v8/BUILD.gn"
 )
-$buildSystemChanged = $false
-foreach ($f in $watchedFiles) {
-    $diff = & git -C $ThoriumMeta diff $localRev $remoteRev -- $f
-    if ($diff) {
-        $buildSystemChanged = $true
-        Log "Upstream changed a file our zen5 patches touch: $f -- patch conflict risk." "WARN"
-    }
+$buildSystemChanged = $thoriumChanged
+if ($buildSystemChanged) {
+    Log "Thorium tag changed ($localTag -> $latestTag). The zen5 patches target these files upstream:" "WARN"
+    foreach ($f in $watchedFiles) { Log "    $f" "WARN" }
+    Log "  apply_zen5_patches.py re-verifies every insertion marker during configure and stops the pipeline if any moved." "WARN"
 }
 
 if (-not ($thoriumChanged -or $chromiumChanged -or $buildSystemChanged)) {
@@ -102,37 +137,56 @@ if (-not $Yes) {
     if ($resp -notin @("y", "Y", "yes", "Yes")) { Log "User declined. Exiting."; exit 0 }
 }
 
+function Invoke-Stage {
+    <#
+    Run one build.ps1 stage and stop the pipeline if it fails.
+
+    The previous code did `& "$RepoRoot\build.ps1" <stage>` then checked
+    $LASTEXITCODE. That check was meaningless: $LASTEXITCODE is only set by
+    NATIVE commands, so after invoking a .ps1 it still holds whatever value
+    the last native process left behind -- possibly from deep inside
+    build.ps1, including an exit code that Invoke-Logged deliberately
+    tolerated via -AllowedExitCodes. It could therefore both miss a real
+    failure and invent one that did not happen.
+
+    build.ps1 runs with $ErrorActionPreference = "Stop" and throws on any
+    stage failure, so the exception IS the reliable signal.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [Parameter(Mandatory)][string[]]$StageArgs,
+        [string]$FailMessage = $null,
+        [int]$FailExit = 1
+    )
+    Log "Stage: $Name"
+    try {
+        & "$RepoRoot\build.ps1" @StageArgs
+    } catch {
+        $msg = if ($FailMessage) { $FailMessage } else { "$Name failed -- stopping pipeline (no release will be produced)." }
+        Log "$msg Detail: $_" "ERROR"
+        exit $FailExit
+    }
+}
+
 # 4. fetch source (build.ps1 sync handles both Chromium and the Thorium meta-repo)
-Log "Stage: sync"
-& "$RepoRoot\build.ps1" sync
-if ($LASTEXITCODE -ne 0) { Log "sync failed -- stopping pipeline." "ERROR"; exit 1 }
+Invoke-Stage -Name "sync" -StageArgs @("sync")
 
 # 5. rebase / reapply zen5 patches -- build.ps1 configure calls
 #    apply_zen5_patches.py, which exits 3 (and configure propagates the
 #    failure) if a marker is no longer found. We surface that distinctly.
-Log "Stage: configure (reapplies zen5 patches; stops on patch conflict)"
-try {
-    & "$RepoRoot\build.ps1" configure -Profile $Profile -Force
-    if ($LASTEXITCODE -ne 0) { throw "configure exited $LASTEXITCODE" }
-} catch {
-    Log "PATCH CONFLICT or configure failure: $_. Upstream Thorium's compiler-flag files changed shape. See patches/zen5/README.md 'Regenerating after upstream changes'. STOPPING -- no build will be attempted from an unpatched/half-patched tree." "ERROR"
-    exit 2
-}
+Invoke-Stage -Name "configure (reapplies zen5 patches; stops on patch conflict)" `
+    -StageArgs @("configure", "-Profile", $Profile, "-Force") `
+    -FailMessage "PATCH CONFLICT or configure failure. Upstream Thorium's compiler-flag files may have changed shape. See patches/zen5/README.md 'Regenerating after upstream changes'. STOPPING -- no build will be attempted from an unpatched/half-patched tree." `
+    -FailExit 2
 
 # 6. rebuild
-Log "Stage: build"
-& "$RepoRoot\build.ps1" build -Profile $Profile
-if ($LASTEXITCODE -ne 0) { Log "build failed -- stopping pipeline." "ERROR"; exit 1 }
+Invoke-Stage -Name "build" -StageArgs @("build", "-Profile", $Profile)
 
 # 7. test
-Log "Stage: test"
-& "$RepoRoot\build.ps1" test -Profile $Profile
-if ($LASTEXITCODE -ne 0) { Log "tests failed -- stopping pipeline (no release will be produced)." "ERROR"; exit 1 }
+Invoke-Stage -Name "test" -StageArgs @("test", "-Profile", $Profile) -FailMessage "tests failed -- stopping pipeline (no release will be produced)."
 
 # 8. ISA analysis
-Log "Stage: analyze"
-& "$RepoRoot\build.ps1" analyze -Profile $Profile
-if ($LASTEXITCODE -ne 0) { Log "ISA analysis failed -- stopping." "ERROR"; exit 1 }
+Invoke-Stage -Name "analyze" -StageArgs @("analyze", "-Profile", $Profile) -FailMessage "ISA analysis failed -- stopping."
 
 # 8b. Regression check against the previous successful build's ISA report
 $prevIsa = Join-Path $BuildDir "isa-report-$Profile.previous.json"
@@ -146,19 +200,13 @@ if (Test-Path $prevIsa) {
 }
 
 # 9. benchmark
-Log "Stage: benchmark"
-& "$RepoRoot\build.ps1" benchmark -Profile $Profile
-if ($LASTEXITCODE -ne 0) { Log "benchmark failed -- stopping (non-fatal data, but per spec we don't package without it)." "ERROR"; exit 1 }
+Invoke-Stage -Name "benchmark" -StageArgs @("benchmark", "-Profile", $Profile) -FailMessage "benchmark failed -- stopping (non-fatal data, but per spec we don't package without it)."
 
 # 10. package only if everything above succeeded
-Log "Stage: package"
-& "$RepoRoot\build.ps1" package -Profile $Profile
-if ($LASTEXITCODE -ne 0) { Log "package failed -- stopping." "ERROR"; exit 1 }
+Invoke-Stage -Name "package" -StageArgs @("package", "-Profile", $Profile) -FailMessage "package failed -- stopping."
 
 # 11. installer -- only now, after full validation
-Log "Stage: installer"
-& "$RepoRoot\build.ps1" installer -Profile $Profile
-if ($LASTEXITCODE -ne 0) { Log "installer build failed -- stopping." "ERROR"; exit 1 }
+Invoke-Stage -Name "installer" -StageArgs @("installer", "-Profile", $Profile) -FailMessage "installer build failed -- stopping."
 
 Copy-Item $curIsa $prevIsa -Force
 Log "=== update.ps1 complete: release candidate produced for profile '$Profile' ==="

@@ -52,9 +52,15 @@ RUNTIME_DISPATCHED_CANDIDATES = {
 
 
 def sh(cmd, cwd=None):
+    # stdin=DEVNULL matters: some probes below invoke clang with `-` (read the
+    # translation unit from stdin). Without an explicit DEVNULL the child
+    # inherits our stdin and blocks forever waiting for EOF -- an unattended
+    # pipeline hang, which is worse than a crash because nothing reports it.
+    if cwd is not None and not os.path.isdir(cwd):
+        return subprocess.CompletedProcess(cmd, 127, "", f"cwd does not exist: {cwd}")
     return subprocess.run(
         cmd, cwd=cwd, shell=True, check=False,
-        capture_output=True, text=True,
+        capture_output=True, text=True, stdin=subprocess.DEVNULL,
     )
 
 
@@ -89,11 +95,18 @@ def get_clang_version(depot_tools_dir: Path, src_dir: Path) -> dict:
     if clang_path.exists():
         r = sh(f'"{clang_path}" --version')
         result["version_string"] = (r.stdout or r.stderr).strip()
-        r2 = sh(f'"{clang_path}" --target=x86_64-pc-windows-msvc -march=znver5 -E -x c - ',)
-        # A successful (or at least non "unknown target CPU") invocation
-        # indicates znver5 is recognized by this clang build.
-        combined = (r2.stdout or "") + (r2.stderr or "")
-        result["supports_znver5"] = "unknown target CPU" not in combined and "znver5" not in combined.lower() or "error" not in combined.lower()
+        # Compile an empty TU from NUL rather than stdin, so there is no way
+        # for this probe to block on a reader.
+        null_src = "NUL" if os.name == "nt" else "/dev/null"
+        r2 = sh(f'"{clang_path}" --target=x86_64-pc-windows-msvc -march=znver5 -E -x c "{null_src}"')
+        combined = ((r2.stdout or "") + (r2.stderr or ""))
+        # The ONLY reliable signal is clang's own rejection message; the
+        # previous expression here was `A and B or C`, which mixed precedence
+        # and reported supports_znver5=True for unrelated failures.
+        lowered = combined.lower()
+        rejected = ("unknown target cpu" in lowered) or ("not a recognized processor" in lowered)
+        result["supports_znver5"] = (r2.returncode == 0) and not rejected
+        result["znver5_probe_returncode"] = r2.returncode
         result["znver5_probe_output"] = combined.strip()[-500:]
     return result
 
@@ -222,12 +235,18 @@ def main():
         print(f"AUDIT INTERNAL ERROR: {e}", file=sys.stderr)
         sys.exit(2)
 
+    if result.get("status") == "NO_SOURCE_TREE":
+        # Deliberately do NOT write audit.json here. build/audit.json is a
+        # tracked, hand-verified artifact; overwriting it with this 4-line
+        # stub destroyed real content the first time `build.ps1 all` ran
+        # before any sync (recovered via `git checkout -- build/audit.json`).
+        # An audit that found nothing has nothing worth persisting.
+        print("ERROR: " + result["message"], file=sys.stderr)
+        print(f"(left {out_path} untouched)", file=sys.stderr)
+        sys.exit(1)
+
     out_path.write_text(json.dumps(result, indent=2))
     print(f"Wrote {out_path}")
-
-    if result.get("status") == "NO_SOURCE_TREE":
-        print("ERROR: " + result["message"], file=sys.stderr)
-        sys.exit(1)
 
     if result["unresolved_questions"]:
         print("\nUnresolved questions:")

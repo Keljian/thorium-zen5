@@ -221,6 +221,41 @@ function Invoke-Logged {
     $script:LastCommandTail = ($tail -join "`n")
 }
 
+function Invoke-NativeCapture {
+    <#
+    Run a native command and return its exit code + combined output WITHOUT
+    letting it throw.
+
+    Why this exists: with $ErrorActionPreference = "Stop" (set at the top of
+    this script), `& somecmd 2>&1` turns anything the command writes to
+    stderr into an ErrorRecord, which under "Stop" becomes a TERMINATING
+    error. So the idiomatic-looking
+
+        $out = & git apply --check $p 2>&1
+        if ($LASTEXITCODE -eq 0) { ... } else { ...skip... }
+
+    can never reach its own else-branch: git writes "error: patch failed..."
+    to stderr and the script dies instead. Verified on rohansdesktopry
+    2026-09-14 -- it threw System.Management.Automation.RemoteException with
+    git's stderr text as the message.
+
+    $ErrorActionPreference is assigned function-scoped here, so it shadows
+    the script-level "Stop" for the duration of the call and reverts on
+    return.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [string[]]$Arguments = @()
+    )
+    $ErrorActionPreference = "Continue"
+    $global:LASTEXITCODE = 0
+    $output = & $Exe @Arguments 2>&1 | ForEach-Object { $_.ToString() }
+    return [PSCustomObject]@{
+        ExitCode = $LASTEXITCODE
+        Output   = (@($output) -join "`n")
+    }
+}
+
 function Resolve-ThoriumLatestStableTag {
     <#
     Returns the tag name of Thorium's current latest STABLE (non-prerelease,
@@ -248,6 +283,20 @@ function Resolve-ThoriumLatestStableTag {
         Write-Log "WARNING: GitHub returned a prerelease as Thorium's 'latest' ($($resp.tag_name)) -- using it anyway since the API is the source of truth here." "WARN"
     }
     return [string]$resp.tag_name
+}
+
+function Get-PythonExe {
+    <#
+    Full path to a python interpreter. Always a full path: Invoke-Logged
+    starts processes via CreateProcess, which resolves a bare name against
+    the parent's PATH and assumes a .exe extension -- so "python3" would
+    miss depot_tools' python3.bat and any Store-alias shim.
+    #>
+    $cmd = Get-Command python -ErrorAction SilentlyContinue
+    if (-not $cmd) { $cmd = Get-Command python3 -ErrorAction SilentlyContinue }
+    if (-not $cmd) { throw "No python interpreter found on PATH (looked for 'python' then 'python3')." }
+    if (-not $cmd.Source) { throw "Resolved python command '$($cmd.Name)' has no file path (Store alias shim?). Install real CPython or put python.exe on PATH." }
+    return $cmd.Source
 }
 
 function Get-JobCount {
@@ -279,8 +328,7 @@ function Assert-Prereqs {
 # ---------------------------------------------------------------------------
 function Invoke-Audit {
     Start-Log "audit"
-    $py = (Get-Command python -ErrorAction SilentlyContinue).Source
-    if (-not $py) { $py = (Get-Command python3).Source }
+    $py = Get-PythonExe
     Invoke-Logged -Exe $py -Arguments @((Join-Path $ScriptsDir "audit_build.py"), "--repo-root", $RepoRoot)
     Write-Log "Audit written to $(Join-Path $BuildDir 'audit.json')"
 }
@@ -372,10 +420,45 @@ function Invoke-SourceOverlay([string]$Flavor) {
     Write-Log "Applying '$Flavor' source overlay from Thorium meta-repo onto $SrcDir ..."
 
     # Mirrors win_scripts/setup.py's thorium_sources list exactly.
+    $overlayDirs = @("ash","build","chrome","chromeos","components","content","extensions",
+                     "google_apis","media","net","sandbox","services","third_party","tools","ui","v8")
+
+    # PRE-FLIGHT: validate every overlay source exists BEFORE copying anything.
+    # Copy-DirOverlay throws on a missing source, but by then earlier dirs are
+    # already copied -- leaving a half-overlaid tree that looks buildable and
+    # isn't. This matters more since sync now checks out a Thorium *release
+    # tag* rather than `main`: a tag's layout is not guaranteed to match, and
+    # the right failure mode is "refuse up front, name what's missing".
+    $required = @((Join-Path $ThoriumMeta "src\BUILD.gn"))
+    foreach ($d in $overlayDirs) { $required += (Join-Path $ThoriumMeta "src\$d") }
+    $required += @(
+        (Join-Path $ThoriumMeta "thorium_shell"),
+        (Join-Path $ThoriumMeta "pak_src\binaries\pak"),
+        (Join-Path $ThoriumMeta "pak_src\binaries\pak-win"),
+        (Join-Path $ThoriumMeta "infra\initial_preferences"),
+        (Join-Path $ThoriumMeta "infra\thor_ver")
+    )
+    if ($Flavor -eq "avx512") {
+        $required += @(
+            (Join-Path $ThoriumMeta "other\AVX2\third_party"),
+            (Join-Path $ThoriumMeta "other\AVX512\thor_ver"),
+            (Join-Path $ThoriumMeta "other\AVX512\thorium_version.txt")
+        )
+    }
+    $missing = $required | Where-Object { -not (Test-Path $_) }
+    if ($missing) {
+        $tagNote = ""
+        $tagMarker = Join-Path $BuildDir "thorium-tag.txt"
+        if (Test-Path $tagMarker) { $tagNote = " (meta-repo is checked out at tag '$((Get-Content $tagMarker -Raw).Trim())')" }
+        throw ("Thorium meta-repo at $ThoriumMeta$tagNote does not have the layout this overlay expects. " +
+               "NOTHING has been copied -- the source tree is untouched. Missing:`n  " +
+               (($missing) -join "`n  ") +
+               "`nIf upstream restructured, update Invoke-SourceOverlay's list against that tag's win_scripts/setup.py.")
+    }
+
     New-Item -ItemType Directory -Force -Path (Join-Path $SrcDir "out\thorium") | Out-Null
     Copy-Item (Join-Path $ThoriumMeta "src\BUILD.gn") $SrcDir -Force
-    foreach ($d in @("ash","build","chrome","chromeos","components","content","extensions",
-                     "google_apis","media","net","sandbox","services","third_party","tools","ui","v8")) {
+    foreach ($d in $overlayDirs) {
         Copy-DirOverlay "src\$d" $d
     }
     Copy-DirOverlay "thorium_shell" "out\thorium"
@@ -392,24 +475,41 @@ function Invoke-SourceOverlay([string]$Flavor) {
         "restore_download_shelf.patch","fix_absl_undefined_symbol.patch","fix_drag_and_drop_on_wayland.patch",
         "fix_touch_emulator_double_tap_zoom.patch","fix_setting_popover_invoker_crash.patch"
     )
+    $appliedCount = 0; $skippedCount = 0
     foreach ($p in $patchList) {
         $src = Join-Path $ThoriumMeta "other\$p"
-        if (-not (Test-Path $src)) { Write-Log "  (skip, not present upstream: $p)" "WARN"; continue }
-        $check = & git -C $SrcDir apply --check $src 2>&1
-        if ($LASTEXITCODE -eq 0) {
-            & git -C $SrcDir apply $src
-            Write-Log "  applied $p"
+        if (-not (Test-Path $src)) { Write-Log "  (skip, not present upstream: $p)" "WARN"; $skippedCount++; continue }
+        $check = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "apply", "--check", $src)
+        if ($check.ExitCode -eq 0) {
+            $apply = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $SrcDir, "apply", $src)
+            if ($apply.ExitCode -eq 0) {
+                Write-Log "  applied $p"; $appliedCount++
+            } else {
+                # --check passed but apply failed: that's not an "expected skip",
+                # it means the tree changed under us or the patch is half-applied.
+                throw "git apply FAILED for '$p' even though --check passed (exit $($apply.ExitCode)). The tree may now be half-patched -- do not build from it. Detail: $($apply.Output)"
+            }
         } else {
-            Write-Log "  '$p' does not apply cleanly (already applied, or upstream changed) -- skipping. Detail: $check" "WARN"
+            Write-Log "  '$p' does not apply cleanly (already applied, or upstream changed) -- skipping. Detail: $($check.Output)" "WARN"
+            $skippedCount++
         }
     }
+    Write-Log "  Thorium misc patches: $appliedCount applied, $skippedCount skipped."
     # ffmpeg patches (different cwd)
     $ffmpegDir = Join-Path $SrcDir "third_party\ffmpeg"
     foreach ($p in @("add-hevc-ffmpeg-decoder-parser.patch", "change-libavcodec-header.patch")) {
-        Copy-Item (Join-Path $ThoriumMeta "other\$p") $ffmpegDir -Force
-        $check = & git -C $ffmpegDir apply --check $p 2>&1
-        if ($LASTEXITCODE -eq 0) { & git -C $ffmpegDir apply $p; Write-Log "  applied ffmpeg/$p" }
-        else { Write-Log "  ffmpeg/$p does not apply cleanly -- skipping. Detail: $check" "WARN" }
+        $ffSrc = Join-Path $ThoriumMeta "other\$p"
+        if (-not (Test-Path $ffSrc)) { Write-Log "  (skip, not present upstream: ffmpeg/$p)" "WARN"; continue }
+        Copy-Item $ffSrc $ffmpegDir -Force
+        $check = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $ffmpegDir, "apply", "--check", $p)
+        if ($check.ExitCode -eq 0) {
+            $apply = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $ffmpegDir, "apply", $p)
+            if ($apply.ExitCode -ne 0) {
+                throw "git apply FAILED for ffmpeg/'$p' even though --check passed (exit $($apply.ExitCode)). Detail: $($apply.Output)"
+            }
+            Write-Log "  applied ffmpeg/$p"
+        }
+        else { Write-Log "  ffmpeg/$p does not apply cleanly -- skipping. Detail: $($check.Output)" "WARN" }
     }
 
     Copy-Item (Join-Path $ThoriumMeta "infra\initial_preferences") (Join-Path $SrcDir "out\thorium") -Force
@@ -424,7 +524,7 @@ function Invoke-SourceOverlay([string]$Flavor) {
         Copy-Item (Join-Path $ThoriumMeta "other\AVX512\thorium_version.txt") (Join-Path $SrcDir "ui\webui\resources\text") -Force
 
         Write-Log "  applying zen5 patches (patches/zen5 -- see that directory's README.md)"
-        $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
+        $py = Get-PythonExe
         Invoke-Logged -Exe $py -Arguments @(
             (Join-Path $ScriptsDir "apply_zen5_patches.py"),
             "--src-dir", $SrcDir, "--capture-diffs", "--patches-dir", $PatchesDir
@@ -442,11 +542,17 @@ function Get-OrDownloadPgoProfile {
 
     Write-Log "Downloading Chromium's official win64 PGO profile (generic, not Zen5-trained -- see docs/BUILD.md 'About PGO')."
     $env = Get-DepotToolsEnv
-    Invoke-Logged -Exe "python3" -Arguments @(
+    # Resolve python to a full path like every other call site does. A bare
+    # "python3" is resolved by CreateProcess against THIS process's PATH (the
+    # EnvVars we hand the child are not used for locating the exe) and, with
+    # no extension, it looks for python3.EXE specifically -- so depot_tools'
+    # python3.BAT would not satisfy it.
+    $py = Get-PythonExe
+    Invoke-Logged -Exe $py -Arguments @(
         "tools/update_pgo_profiles.py", "--target=win64", "update",
         "--gs-url-base=chromium-optimization-profiles/pgo_profiles"
     ) -WorkingDirectory $SrcDir -EnvVars $env
-    Invoke-Logged -Exe "python3" -Arguments @(
+    Invoke-Logged -Exe $py -Arguments @(
         "v8/tools/builtins-pgo/download_profiles.py",
         "--depot-tools=$DepotTools", "--force", "download"
     ) -WorkingDirectory $SrcDir -EnvVars $env
@@ -493,7 +599,26 @@ function Invoke-Configure {
 
     # Re-audit now that the tree is patched/configured, so build/audit.json
     # reflects what will actually be built, not just what was synced.
+    # Invoke-Audit calls Start-Log "audit", which repoints $script:LogFile --
+    # so re-point it back afterwards or "Configure complete" lands in audit.log.
     Invoke-Audit
+    $script:LogFile = Join-Path $LogsDir "configure.log"
+
+    # The zen5 profile is only meaningful if the pinned clang actually knows
+    # -march=znver5. audit_build.py probes for this; fail loudly here rather
+    # than letting the build silently fall back to a coarser -march.
+    if ($Profile -eq "zen5") {
+        $auditPath = Join-Path $BuildDir "audit.json"
+        if (Test-Path $auditPath) {
+            $auditJson = Get-Content $auditPath -Raw | ConvertFrom-Json
+            if ($auditJson.compiler -and $auditJson.compiler.supports_znver5 -eq $false) {
+                throw ("The pinned clang does not recognize -march=znver5, so a 'zen5' build would " +
+                       "silently degrade to a coarser target. Probe output:`n$($auditJson.compiler.znver5_probe_output)`n" +
+                       "Sync against a newer Chromium revision (newer pinned clang), or build -Profile generic-avx512 instead.")
+            }
+        }
+    }
+
     Write-Log "Configure complete for profile '$Profile'."
 }
 
@@ -517,7 +642,7 @@ function Invoke-Build {
         -Arguments @("-C", "out\thorium-$Profile", "thorium_installer", "-j$jobs") `
         -WorkingDirectory $SrcDir -EnvVars $env
 
-    $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
+    $py = Get-PythonExe
     Invoke-Logged -Exe $py -Arguments @(
         (Join-Path $ScriptsDir "generate_manifest.py"),
         "--repo-root", $RepoRoot, "--profile", $Profile, "--build-status", "success"
@@ -558,16 +683,25 @@ function Invoke-Analyze {
 
     $objdump = Join-Path $SrcDir "third_party\llvm-build\Release+Asserts\bin\llvm-objdump.exe"
     $symbolizer = Join-Path $SrcDir "third_party\llvm-build\Release+Asserts\bin\llvm-symbolizer.exe"
-    $pdb = [System.IO.Path]::ChangeExtension($binary, ".dll.pdb")
+    # Chromium emits "<file>.<ext>.pdb" (chrome.dll.pdb, thorium.exe.pdb), so
+    # append rather than ChangeExtension -- ChangeExtension($binary,".dll.pdb")
+    # turned thorium.exe into thorium.dll.pdb, a file that never exists.
+    $pdb = "$binary.pdb"
+    if (-not (Test-Path $pdb)) {
+        Write-Log "No PDB at $pdb -- ISA report will have no function attribution." "WARN"
+        $pdb = $null
+    }
 
-    $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
-    Invoke-Logged -Exe $py -Arguments @(
+    $py = Get-PythonExe
+    $analyzeArgs = @(
         (Join-Path $ScriptsDir "analyze_isa.py"),
-        "--binary", $binary, "--objdump", $objdump, "--symbolizer", $symbolizer, "--pdb", $pdb,
+        "--binary", $binary, "--objdump", $objdump, "--symbolizer", $symbolizer,
         "--label", $Profile,
         "--out-json", (Join-Path $BuildDir "isa-report-$Profile.json"),
         "--out-txt", (Join-Path $BuildDir "isa-report-$Profile.txt")
     )
+    if ($pdb) { $analyzeArgs += @("--pdb", $pdb) }
+    Invoke-Logged -Exe $py -Arguments $analyzeArgs
     Write-Log "ISA report written for profile '$Profile'."
 }
 
@@ -581,7 +715,7 @@ function Invoke-Benchmark {
     if (-not $exe) { $exe = Get-ChildItem $outDir -Filter "chrome.exe" -ErrorAction SilentlyContinue }
     if (-not $exe) { throw "No built browser executable in $outDir." }
 
-    $py = (Get-Command python -ErrorAction SilentlyContinue).Source; if (-not $py) { $py = (Get-Command python3).Source }
+    $py = Get-PythonExe
     $cmdArgs = @(
         (Join-Path $ScriptsDir "benchmark.py"),
         "--binary", $exe.FullName, "--label", $Profile, "--runs", "5",
@@ -700,7 +834,11 @@ function Invoke-Installer {
     $version = "0.0.0"
     if (Test-Path $manifestPath) {
         $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
-        if ($m.source_revisions.chromium_src_commit) { $version = $m.source_revisions.chromium_src_commit.Substring(0, 10) }
+        $sha = $m.source_revisions.chromium_src_commit
+        # Length-guarded like Invoke-Package's copy: generate_manifest.py writes
+        # null here when `git rev-parse` fails, and an unguarded Substring(0,10)
+        # throws on anything shorter than 10 chars.
+        if ($sha) { $version = $sha.Substring(0, [Math]::Min(10, $sha.Length)) }
     }
 
     Invoke-Logged -Exe $iscc -Arguments @(
@@ -718,7 +856,12 @@ function Invoke-Installer {
 # all
 # ---------------------------------------------------------------------------
 function Invoke-All {
-    Invoke-Audit
+    # NOTE: no standalone Invoke-Audit first. audit_build.py requires a synced
+    # checkout and exits 1 without one, so on a fresh machine `build.ps1 all`
+    # died at step 1 before sync ever ran. Invoke-Sync calls Invoke-Audit at
+    # its end (against a tree that actually exists), and Invoke-Configure
+    # re-audits after patching -- so audit still runs twice, just at points
+    # where it can succeed.
     Invoke-Sync
     Invoke-Configure
     Invoke-Build
