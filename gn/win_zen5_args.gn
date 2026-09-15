@@ -13,28 +13,56 @@
 # Backward CPU compatibility is explicitly NOT a goal: a binary built this
 # way will fault with an illegal instruction on any pre-Zen5 machine.
 #
-# WHY -mtune IS NOT znver5
-# ------------------------
-# -mtune=znver4/znver5 MISCOMPILES under ThinLTO on this toolchain
-# (Chromium 154, clang 24.0.0git, Windows x64, is_official_build). It is a
-# SCHEDULER bug, not an ISA one: holding the instruction set fixed and
-# varying only -mtune reproduces it exactly, and disabling every AVX-512
-# extension while keeping -mtune=znver4 still fails. Full matrix and the
-# two failure signatures are documented in scripts/apply_zen5_patches.py
-# and docs/TOOLCHAIN-BUGS.md.
+# ZEN 5 SCHEDULING IS ON, VIA A TAIL-MERGE WORKAROUND
+# ---------------------------------------------------
+# -mtune=znver4/znver5 MISCOMPILES under ThinLTO on this toolchain, producing
+#     lld-link: error: <unknown>:0: Missing .seh_endepilogue in <fn>
+# plus ~20 symbols dropped through whole-program-devirtualization branch
+# funnels. It is a SCHEDULER-triggered bug, not an ISA one: holding the
+# instruction set fixed and varying only -mtune reproduces it exactly, and
+# keeping -mtune=znver4 while disabling EVERY AVX-512 extension still fails.
 #
-# "generic" specifically -- NOT an Intel -mtune. prefer-256-bit is a TUNING
-# feature, so -mtune=skylake-avx512 builds cleanly but emits ZERO 512-bit
-# instructions, which would silently discard the point of this profile.
-# Measured on a vectorizable loop:
-#     znver5 / znver5           zmm 72  ymm 18   (intended; unbuildable)
-#     znver5 / generic          zmm 72  ymm 18   (what we ship)
-#     znver5 / skylake-avx512   zmm  0  ymm 72   (no 512-bit code at all)
+# This is llvm/llvm-project#199290 -- "[WinEH] Branch folding can lead to
+# `Missing .seh_endepilogue` error", confirmed upstream, whose own reduced
+# reproducer uses `llc -mcpu=znver3`. Root cause per that issue: the
+# block-placement pass folds tails containing SEH_EndEpilogue, orphaning the
+# matching SEH_BeginEpilogue. A different scheduling model changes which
+# tails are foldable, which is why it looks like an AMD-tuning bug.
 #
-# We therefore lose Zen 5 instruction SCHEDULING only. The ISA, 512-bit
-# vectorization, PGO and ThinLTO are all intact. Set zen5_mtune back to
-# "znver5" once LLVM fixes this; the failure is a loud link error.
+# Verified against that diagnosis on the root_store_tool canary, -mtune=znver5
+# throughout, ThinLTO cache cleared each time (-mllvm flags are NOT in the
+# cache key):
 #
+#     (no workaround)                          FAIL
+#     -mllvm:-enable-tail-merge=false          PASS   <- shipped
+#     -mllvm:-disable-tail-duplicate           PASS
+#     -mllvm:-disable-block-placement          PASS
+#
+# All three avoid it; tail-merge is the right one to give up:
+#   * it is the direct match to the diagnosed cause (tail folding);
+#   * tail MERGING is chiefly a code-SIZE optimization, and disabling it can
+#     marginally help speed (fewer shared tails, less converged control flow),
+#     so the cost is binary size;
+#   * tail DUPLICATION and block PLACEMENT are both speed optimizations, and
+#     disabling either would trade away more performance than the Zen 5
+#     scheduling model we are buying back.
+#
+# So we keep the full Zen 5 ISA *and* the Zen 5 scheduling model, and pay in
+# binary size only. Drop the ldflag and this reverts to a hard link error --
+# never a silent miscompile.
+#
+# CAVEAT, recorded honestly: the in-directory control run for this specific
+# comparison was invalidated (its build was interrupted mid-flight and exited
+# without the real failure signature). The FAIL row above is therefore carried
+# from three earlier matrices that all reproduced -mtune=znver5 failing, not
+# from a same-run A/B. Re-run it if you want a clean control.
+#
+# Upstream status: still reproduces on a trunk clang roll ~4,000 commits newer
+# (llvmorg-24-init-7747-g62397f8b), so do not expect this to age out soon.
+# Our findings are attached to the upstream issue.
+
+zen5_extra_target_ldflags = [ "-mllvm:-enable-tail-merge=false" ]
+
 # These two are pinned explicitly rather than left to the declare_args
 # defaults so that args.gn records what was actually built, and so
 # verify-source.ps1 can assert them.
@@ -43,4 +71,48 @@ use_znver5 = true
 use_generic_avx512 = false
 
 zen5_march = "znver5"
-zen5_mtune = "generic"
+zen5_mtune = "znver5"
+
+# SLP VECTORIZER CAPPED AT 256 BITS
+# ---------------------------------
+# A THIRD toolchain bug, and this one is not AMD-specific: clang 24's X86
+# backend cannot select `v4i64 = zero_extend_vector_inreg` when 512-bit
+# vectors are enabled, and aborts instruction selection:
+#
+#   LLVM ERROR: Cannot select: v4i64 = zero_extend_vector_inreg
+#   In function: SkPathRawShapes::RRect::RRect(...)
+#
+# Reproduced in seconds by compiling that one Skia file. The trigger is
+# 512-bit codegen generally -- -mavx512f alone is enough, and
+# -march=skylake-avx512 or -march=x86-64-v4 crash identically. An Intel
+# AVX-512 build of Chromium would hit this too.
+#
+# Narrowed to the SLP vectorizer specifically, by elimination:
+#     -fno-vectorize      (loop vectorizer OFF, SLP on)  -> still crashes
+#     -fno-slp-vectorize  (SLP OFF, loop vectorizer on)  -> FIXED
+#     -mllvm -slp-max-reg-size=256                       -> FIXED
+#
+# This is why the fix is an SLP register cap and NOT -mprefer-vector-width.
+# Measured on a file containing both an _mm512_fmadd_ps intrinsic and an
+# auto-vectorizable loop:
+#
+#     unrestricted 512-bit (crashes)      zmm 38   ymm  8
+#     slp-max-reg-size=256  (shipped)     zmm 38   ymm  8   <- identical
+#     prefer-vector-width=256             zmm  6   ymm 32   <- 85% of the
+#                                                              512-bit code
+#                                                              thrown away
+#
+# So this costs nothing measurable: loop vectorization and explicit
+# intrinsics keep full 512-bit width; only straight-line SLP vectorization
+# is capped, and 512-bit SLP is rare and rarely profitable anyway.
+#
+# Applied as an LDFLAG (see apply_zen5_patches.py): the vectorizers run in
+# the ThinLTO backend, post-link, so a cflag never reaches them.
+#
+# WARNING: -mllvm flags are NOT part of LLVM's ThinLTO cache key. After
+# changing this, delete out/thorium-zen5/thinlto-cache or the link will
+# silently reuse the old codegen and appear unchanged.
+#
+# Set to "" once LLVM fixes the ISel gap. The failure is a hard link error.
+
+zen5_slp_max_reg_size = "256"
