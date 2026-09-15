@@ -105,17 +105,89 @@ Note that the test stage is currently `base_unittests` plus a headless
 codegen-altering toolchain workarounds; a miscompile from any of them
 would more likely surface in Blink or V8 than in base.
 
-## Scheduled checking (Windows Task Scheduler)
+## Publishing
 
-Create a task that runs:
+`build.ps1 publish` uploads the newest packaged release for a profile to
+GitHub Releases, tagged `v<chromium-version>-<profile>`. Release notes are
+generated from `build-manifest-<profile>.json` and the ISA report, so what is
+published always matches what was measured.
+
+The repo is **private**, and that is not incidental. This build sets
+`proprietary_codecs`, `ffmpeg_branding = "Chrome"` and `enable_widevine`, none
+of which are ours to redistribute. Publishing here is off-machine storage and
+version history for one person. Do not make the repo public without first
+stripping those from the published artifacts.
+
+`update.ps1` runs publish last and treats a failure there as a **warning, not
+a pipeline failure**. Everything before it produced a good installable build
+sitting in `releases\`; an expired `gh` token is a reason to say so, not a
+reason to mark a two-hour build as failed. Re-run `build.ps1 publish` on its
+own once the cause is fixed.
+
+## Versioning, and why it changed
+
+The installer used to take a 10-char commit sha as its version, which became
+`DisplayVersion` in Add/Remove Programs. That made the only question an
+updater has to answer -- "is the build I just made newer than the one
+installed?" -- unanswerable, because shas do not order.
+
+Now:
+
+- **Version** is the Chromium version, e.g. `154.0.8037.17`. Orderable.
+- **BuildId** is `<version>+<repo-sha10>+<utc-timestamp>`, so two builds of the
+  *same* Chromium version (a flag change, a toolchain roll) are still
+  distinguishable.
+
+Both are written by the installer to `HKCU\Software\ThoriumZen5`, and removed
+on uninstall, so a stale entry never outlives the install it describes.
+
+## Full automation
+
+```powershell
+.\scripts\Register-ThoriumUpdateNotifier.ps1    # once: AppUserModelID + URI handler, HKCU only
+.\scripts\Install-ThoriumTasks.ps1 -WhatIf      # look first
+.\scripts\Install-ThoriumTasks.ps1              # then register
+```
+
+Two scheduled tasks, both per-user:
+
+**"Thorium Zen5 - Build upstream updates"** runs `update.ps1 -Yes` daily at
+03:00. `update.ps1` self-gates, so on a day when nothing has shipped this
+costs one HTTP request. Runs whether or not you are logged on, at limited
+privilege: nothing in the pipeline needs admin, and an unattended multi-hour
+build is the last thing that should run elevated.
+
+**"Thorium Zen5 - Offer update"** runs `scripts\Check-ThoriumUpdate.ps1` at
+logon and every four hours, **in the interactive session** -- a toast raised
+from Session 0 is never displayed to anyone. It installs nothing on its own.
+It compares `HKCU\Software\ThoriumZen5` against the newest complete release
+under `releases\` and, if there is something newer, raises a toast whose
+"Install now" button runs the installer silently.
+
+The check is local, not a round trip through GitHub, because the machine that
+builds this browser and the machine that runs it are the same machine.
+`-Source GitHub` exists for the day a second machine wants the same build; it
+can only compare versions, not BuildIds, so same-version rebuilds are
+invisible over that path.
+
+### Why the toast needs registering
+
+Windows drops a toast raised by a process with no registered
+AppUserModelID, silently: no exception, nothing in Action Center. And toast
+buttons cannot run a command directly, because the toast usually outlives the
+process that raised it -- `activationType="protocol"` is the only route that
+survives that. `Register-ThoriumUpdateNotifier.ps1` creates both, under HKCU,
+no admin, and `-Unregister` removes them.
+
+Without it the checker still works and still tells you on the console; it just
+says so instead of pretending it showed you something.
+
+### Manual polling, if you would rather not have the tasks
 
 ```
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\thorium\update.ps1 -CheckOnly
 ```
 
-on whatever cadence you like; daily is reasonable. Exit code `10` means an
-update is available. Wire a second action, or a wrapper script, to run
-`update.ps1 -Yes` when that happens if you want unattended updates.
-
-The `-CheckOnly` path deliberately never installs or publishes anything:
-nothing ships without completing the build/test pipeline first.
+Exit code `10` means an update is available. The `-CheckOnly` path never
+installs or publishes anything: nothing ships without completing the
+build/test pipeline first.

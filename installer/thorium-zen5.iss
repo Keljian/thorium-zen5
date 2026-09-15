@@ -3,9 +3,17 @@
 ; Invoked by build.ps1's Invoke-Installer with:
 ;   /DAppFilesDir=<path to extracted browser application files>
 ;   /DMainExeName=<thorium.exe or chrome.exe>
-;   /DThoriumZen5Version=<short commit sha or version string>
+;   /DThoriumZen5Version=<Chromium version, e.g. 154.0.8037.17>
+;   /DBuildId=<chromium_tag+repo_sha+timestamp, uniquely identifies this build>
 ;   /DProfileName=<zen5|generic-avx512|baseline>
 ;   /DOutputDir=<releases dir>
+;
+; ThoriumZen5Version USED TO BE a 10-char commit sha. It is now the Chromium
+; version, because it ends up in Add/Remove Programs as DisplayVersion and the
+; update checker (scripts/Check-ThoriumUpdate.ps1) has to ORDER it. A sha is
+; not orderable, so "is the built one newer than the installed one" was not an
+; answerable question. Two builds of the SAME Chromium version are
+; distinguished by BuildId instead, which is written to the registry below.
 ;
 ; See installer/README.md for why AppFilesDir comes from extracting
 ; mini_installer.exe's chrome.7z rather than running mini_installer.exe's
@@ -21,7 +29,10 @@
   #define MainExeName "thorium.exe"
 #endif
 #ifndef ThoriumZen5Version
-  #define ThoriumZen5Version "0.0.0"
+  #define ThoriumZen5Version "0.0.0.0"
+#endif
+#ifndef BuildId
+  #define BuildId "unknown"
 #endif
 #ifndef ProfileName
   #define ProfileName "zen5"
@@ -59,6 +70,19 @@ WizardStyle=modern
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Registry]
+; The update checker's source of truth for "what is installed right now".
+;
+; Inno already writes DisplayVersion under the Uninstall key, but that is keyed
+; on the AppId GUID and is awkward to read; more importantly it cannot tell two
+; builds of the same Chromium version apart. These three values can, and they
+; are removed on uninstall (uninsdeletekey) so a stale entry never outlives the
+; install it describes.
+Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "Version";     ValueData: "{#ThoriumZen5Version}"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "BuildId";     ValueData: "{#BuildId}";             Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "Profile";     ValueData: "{#ProfileName}";         Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}";                  Flags: uninsdeletekey
 
 [Tasks]
 Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked

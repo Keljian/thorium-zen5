@@ -180,6 +180,31 @@ Invoke-Stage -Name "package" -StageArgs @("package", "-Profile", $Profile) -Fail
 # 11. installer -- only now, after full validation
 Invoke-Stage -Name "installer" -StageArgs @("installer", "-Profile", $Profile) -FailMessage "installer build failed -- stopping."
 
+# 12. publish to GitHub Releases.
+#
+# Deliberately NOT gated like the stages above. Everything before this line
+# produced a good, installable build sitting in releases\; a GitHub outage or
+# an expired gh token is a reason to say so, not a reason to mark a two-hour
+# build as a failed pipeline. `build.ps1 publish` re-runs on its own.
+Log "Stage: publish"
+$published = $false
+try {
+    & "$RepoRoot\build.ps1" publish -Profile $Profile
+    $published = $true
+} catch {
+    Log ("publish failed -- the build itself is fine and is packaged under releases\. " +
+         "Re-run '.\build.ps1 publish -Profile $Profile' once the cause is fixed. Detail: $_") "WARN"
+}
+
 Copy-Item $curIsa $prevIsa -Force
-Log "=== update.ps1 complete: release candidate produced for profile '$Profile' ==="
+Log "=== update.ps1 complete: release candidate produced for profile '$Profile' (published=$published) ==="
+
+# 13. Offer it. The machine that builds and the machine being updated are the
+#     same one, so this checks releases\ directly rather than making a round
+#     trip through GitHub. See scripts/Check-ThoriumUpdate.ps1.
+$notifier = Join-Path $RepoRoot "scripts\Check-ThoriumUpdate.ps1"
+if (Test-Path $notifier) {
+    try { & $notifier -Profile $Profile } catch { Log "Update notification failed (non-fatal): $_" "WARN" }
+}
+
 exit 0

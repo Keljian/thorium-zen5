@@ -24,13 +24,14 @@
         benchmark   run local startup/Speedometer benchmarks
         package     stage a release folder + build-manifest.json
         installer   build the Inno Setup installer (Thorium Zen5 <version>.exe)
+        publish     upload the packaged release to GitHub Releases (private repo)
         all         audit -> sync -> configure -> build -> test -> analyze ->
-                    benchmark -> package -> installer, for one profile, and
-                    STOP at the first failure (no partial releases).
+                    benchmark -> package -> installer -> publish, for one
+                    profile, and STOP at the first failure (no partial releases).
 
 .PARAMETER Command
     One of: audit, sync, configure, build, test, analyze, benchmark, package,
-    installer, all.
+    installer, publish, all.
 
 .PARAMETER Profile
     One of: baseline, zen5, generic-avx512. Default: zen5.
@@ -52,7 +53,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet("audit", "sync", "configure", "build", "test", "analyze", "benchmark", "package", "installer", "all")]
+    [ValidateSet("audit", "sync", "configure", "build", "test", "analyze", "benchmark", "package", "installer", "publish", "all")]
     [string]$Command,
 
     [ValidateSet("baseline", "zen5", "generic-avx512")]
@@ -1129,26 +1130,187 @@ function Invoke-Installer {
         if (-not $iscc) { throw "Inno Setup still not found after install attempt." }
     }
 
-    $manifestPath = Join-Path $BuildDir "build-manifest-$Profile.json"
-    $version = "0.0.0"
-    if (Test-Path $manifestPath) {
-        $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
-        $sha = $m.source_revisions.chromium_src_commit
-        # Length-guarded like Invoke-Package's copy: generate_manifest.py writes
-        # null here when `git rev-parse` fails, and an unguarded Substring(0,10)
-        # throws on anything shorter than 10 chars.
-        if ($sha) { $version = $sha.Substring(0, [Math]::Min(10, $sha.Length)) }
-    }
+    # Version and BuildId.
+    #
+    # This used to pass a 10-char commit sha as the version. That sha became
+    # DisplayVersion in Add/Remove Programs, which meant the question the update
+    # checker has to answer -- "is the build I just made newer than the one
+    # installed?" -- had no answer, because shas do not order. So the version is
+    # now the Chromium version, which does, and BuildId carries the identity a
+    # version number cannot: two builds of the SAME Chromium version (a flag
+    # change, a toolchain roll) differ in BuildId and nowhere else.
+    $ids = Get-BuildIdentity
+    Write-Log "Installer version=$($ids.Version)  BuildId=$($ids.BuildId)"
 
     Invoke-Logged -Exe $iscc -Arguments @(
         (Join-Path $RepoRoot "installer\thorium-zen5.iss"),
         "/DAppFilesDir=$($extracted.AppFilesDir)",
         "/DMainExeName=$($extracted.MainExeName)",
-        "/DThoriumZen5Version=$version",
+        "/DThoriumZen5Version=$($ids.Version)",
+        "/DBuildId=$($ids.BuildId)",
         "/DProfileName=$Profile",
         "/DOutputDir=$ReleasesDir"
     )
-    Write-Log "Installer built -- see $ReleasesDir\Thorium-Zen5-Setup-*.exe"
+
+    # Inno writes into $ReleasesDir, not into the timestamped folder Invoke-Package
+    # made, because package runs BEFORE installer. Move it in, so one release
+    # folder holds everything that describes a build and `publish` has a single
+    # directory to upload.
+    $setupExe = Join-Path $ReleasesDir "Thorium-Zen5-Setup-$Profile-$($ids.Version).exe"
+    if (-not (Test-Path $setupExe)) {
+        throw "Inno Setup reported success but $setupExe is missing -- OutputBaseFilename in installer\thorium-zen5.iss may no longer match what build.ps1 expects."
+    }
+    $releaseDir = Get-LatestReleaseDir
+    if ($releaseDir) {
+        Move-Item $setupExe (Join-Path $releaseDir (Split-Path $setupExe -Leaf)) -Force
+        Write-Log "Installer built and moved into $releaseDir"
+    } else {
+        Write-Log "Installer built at $setupExe (no packaged release folder found to move it into -- run 'package' first)." "WARN"
+    }
+}
+
+# ---------------------------------------------------------------------------
+# publish  (upload the packaged release to GitHub Releases)
+# ---------------------------------------------------------------------------
+function Get-BuildIdentity {
+    <#
+    The version and the unique build identity, both read from
+    build/build-manifest-<profile>.json so that the installer, the published
+    release and the update checker cannot disagree about what was built.
+
+    Version  -- the Chromium version, e.g. "154.0.8037.17". Orderable, which is
+                the whole point; see Invoke-Installer.
+    BuildId  -- "<chromium_tag>+<repo_sha10>+<yyyyMMddHHmmss>". Distinguishes
+                two builds of the same Chromium version.
+    #>
+    $manifestPath = Join-Path $BuildDir "build-manifest-$Profile.json"
+    if (-not (Test-Path $manifestPath)) {
+        throw "No build-manifest-$Profile.json in $BuildDir. Run '.\build.ps1 build -Profile $Profile' first -- a release with no manifest cannot be identified."
+    }
+    $m = Get-Content $manifestPath -Raw | ConvertFrom-Json
+
+    $version = $m.source_revisions.chromium_tag
+    if (-not $version -or $version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+        throw "build-manifest-$Profile.json has no usable chromium_tag (got '$version'). The installer version has to be orderable; refusing to fall back to a placeholder."
+    }
+
+    $repoSha = $m.source_revisions.thorium_zen5_repo_commit
+    $repoShort = if ($repoSha) { $repoSha.Substring(0, [Math]::Min(10, $repoSha.Length)) } else { "nosha" }
+
+    # generated_at_utc is ISO-8601; compact it so the id stays filename- and
+    # tag-safe. Fall back to now rather than failing: the timestamp is a
+    # tiebreaker, not an identity.
+    $stamp = try { ([datetime]$m.generated_at_utc).ToUniversalTime().ToString("yyyyMMddHHmmss") }
+             catch { (Get-Date).ToUniversalTime().ToString("yyyyMMddHHmmss") }
+
+    return @{
+        Version  = $version
+        BuildId  = "$version+$repoShort+$stamp"
+        RepoSha  = $repoSha
+        Manifest = $m
+    }
+}
+
+function Get-LatestReleaseDir {
+    Get-ChildItem $ReleasesDir -Directory -Filter "thorium-zen5-$Profile-*" -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -First 1
+}
+
+function Get-RepoSlug {
+    <#
+    owner/name for gh, resolved from the git remote rather than left to gh's
+    cwd inference. Every other stage here is callable from anywhere, and a
+    scheduled task will not have its working directory inside this repo.
+    #>
+    $r = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $RepoRoot, "remote", "get-url", "origin")
+    if ($r.ExitCode -ne 0) { throw "Could not read the 'origin' remote from $RepoRoot -- publish needs to know which repository to publish to." }
+    $url = $r.Output.Trim()
+    if ($url -notmatch '[:/]([^/:]+)/([^/]+?)(\.git)?\s*$') { throw "Unrecognized git remote URL: $url" }
+    return "$($Matches[1])/$($Matches[2])"
+}
+
+function Invoke-Publish {
+    <#
+    Upload the newest packaged release for this profile to GitHub Releases.
+
+    The repo is PRIVATE, and that is deliberate: this build sets
+    proprietary_codecs, ffmpeg_branding="Chrome" and enable_widevine, none of
+    which are ours to redistribute publicly. Publishing here is off-machine
+    storage and version history for one person, not distribution. Do not make
+    the repo public without first stripping those from the published artifacts.
+    #>
+    Start-Log "publish"
+
+    $gh = (Get-Command gh -ErrorAction SilentlyContinue)
+    if (-not $gh) { throw "GitHub CLI (gh) not found on PATH. Install it, or skip the publish stage." }
+
+    $releaseDir = Get-LatestReleaseDir
+    if (-not $releaseDir) { throw "No packaged release for profile '$Profile' under $ReleasesDir. Run '.\build.ps1 package' first." }
+
+    $assets = Get-ChildItem $releaseDir.FullName -File
+    $setup = $assets | Where-Object { $_.Name -like "Thorium-Zen5-Setup-*" } | Select-Object -First 1
+    if (-not $setup) {
+        throw "$($releaseDir.FullName) has no Thorium-Zen5-Setup-*.exe. Run '.\build.ps1 installer -Profile $Profile' before publishing -- publishing reports without the thing they describe is worse than not publishing."
+    }
+
+    $ids = Get-BuildIdentity
+    $tag = "v$($ids.Version)-$Profile"
+
+    # Release notes from the manifest and the ISA report, so what is published
+    # always matches what was measured rather than being retyped.
+    $isaTxt = Join-Path $releaseDir.FullName "isa-report-$Profile.txt"
+    $fence = [string][char]0x60 * 3     # ``` -- spelled this way so the markdown
+                                        # fence is not three escaped backticks
+                                        # inside a double-quoted PowerShell string
+    $nl = [Environment]::NewLine
+    $isaBlock = if (Test-Path $isaTxt) {
+        $fence + $nl + (Get-Content $isaTxt -Raw).TrimEnd() + $nl + $fence
+    } else {
+        "(no ISA report in this release)"
+    }
+    $clang = ($ids.Manifest.compiler.clang_version_string -split "`n")[0]
+
+    $notes = @"
+Personal Zen 5 build. Not a redistribution.
+
+| | |
+|---|---|
+| Chromium | ``$($ids.Version)`` |
+| Chromium commit | ``$($ids.Manifest.source_revisions.chromium_src_commit)`` |
+| Profile | ``$Profile`` |
+| Build id | ``$($ids.BuildId)`` |
+| Repo commit | ``$($ids.RepoSha)`` |
+| Compiler | ``$clang`` |
+
+Requires an AMD Zen 5 CPU. This binary uses the full znver5 instruction set
+and will fault with an illegal instruction on anything older.
+
+ISA measured in the shipped chrome.dll:
+$isaBlock
+"@
+    $notesFile = Join-Path $env:TEMP "thorium-zen5-notes-$([guid]::NewGuid()).md"
+    Set-Content -Path $notesFile -Value $notes -Encoding UTF8
+
+    $slug = Get-RepoSlug
+    try {
+        $existing = Invoke-NativeCapture -Exe "gh" -Arguments @("release", "view", $tag, "--repo", $slug, "--json", "tagName")
+        if ($existing.ExitCode -eq 0) {
+            Write-Log "Release $tag already exists on $slug -- uploading assets with --clobber rather than creating a second one." "WARN"
+            Invoke-Logged -Exe "gh" -Arguments (@("release", "upload", $tag, "--repo", $slug, "--clobber") + ($assets | ForEach-Object { $_.FullName }))
+        } else {
+            Write-Log "Creating release $tag on $slug with $($assets.Count) asset(s)."
+            Invoke-Logged -Exe "gh" -Arguments (@(
+                "release", "create", $tag,
+                "--repo", $slug,
+                "--title", "Thorium Zen5 $($ids.Version) ($Profile)",
+                "--notes-file", $notesFile
+            ) + ($assets | ForEach-Object { $_.FullName }))
+        }
+    } finally {
+        Remove-Item $notesFile -Force -ErrorAction SilentlyContinue
+    }
+
+    Write-Log "Published $tag."
 }
 
 # ---------------------------------------------------------------------------
@@ -1169,6 +1331,7 @@ function Invoke-All {
     Invoke-Benchmark
     Invoke-Package
     Invoke-Installer
+    Invoke-Publish
     Write-Host "`n=== .\build.ps1 all complete for profile '$Profile' ===" -ForegroundColor Green
 }
 
@@ -1184,6 +1347,7 @@ switch ($Command) {
     "benchmark" { Invoke-Benchmark }
     "package"   { Invoke-Package }
     "installer" { Invoke-Installer }
+    "publish"   { Invoke-Publish }
     "all"       { Invoke-All }
 }
 } finally {
