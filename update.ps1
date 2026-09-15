@@ -50,21 +50,9 @@ function Log([string]$m, [string]$lvl = "INFO") {
 
 Log "=== update.ps1 starting (profile=$Profile, CheckOnly=$CheckOnly) ==="
 
-function Resolve-ChromiumStableTag {
-    # Kept in sync with the identical function in build.ps1 -- see the comment
-    # there for why this project tracks the current Chromium STABLE release
-    # rather than trunk, and no longer tracks Thorium at all.
-    $uri = "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=1"
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers @{ "User-Agent" = "thorium-zen5-update.ps1" } -UseBasicParsing
-    } catch {
-        throw "Failed to resolve the current Chromium stable version from $uri -- check network access: $_"
-    }
-    $version = @($resp)[0].version
-    if (-not $version) { throw "chromiumdash returned no 'version' for channel=Stable platform=Windows." }
-    if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw "chromiumdash returned a non-version string: '$version'" }
-    return [string]$version
-}
+# Shared with build.ps1 -- no longer duplicated here. See that file for why
+# "highest version" rather than "first entry" matters.
+. (Join-Path $RepoRoot "scripts\ChromiumVersion.ps1")
 
 # 1. Is there a newer Chromium stable release than the one we last synced?
 #    build.ps1 sync pins the checkout to a Chromium stable tag and records it
@@ -76,8 +64,16 @@ if (-not (Test-Path $SrcDir)) {
 $tagMarkerFile = Join-Path $BuildDir "chromium-tag.txt"
 $localTag  = if (Test-Path $tagMarkerFile) { (Get-Content $tagMarkerFile -Raw).Trim() } else { $null }
 $latestTag = Resolve-ChromiumStableTag
-$chromiumChanged = ($localTag -ne $latestTag)
-Log "Chromium: synced=$localTag  latest-stable=$latestTag  changed=$chromiumChanged"
+
+# Only ever move FORWARD. Previously this was `$localTag -ne $latestTag`, which
+# treats "different" as "newer" -- so a resolution returning an older milestone
+# (see ChromiumVersion.ps1) would have driven a full sync+rebuild BACKWARDS,
+# discarding shipped security fixes. Equality is not the question; ordering is.
+$chromiumChanged = Test-ChromiumVersionIsNewer -Candidate $latestTag -Current $localTag
+Log "Chromium: synced=$localTag  latest-stable=$latestTag  newer=$chromiumChanged"
+if ($localTag -and -not $chromiumChanged -and $localTag -ne $latestTag) {
+    Log "Resolved stable ($latestTag) is NOT newer than the synced tag ($localTag). Refusing to downgrade; treating as up to date." "WARN"
+}
 
 # 2. Have we ever produced a build for this profile? If not, treat as changed
 #    so a first run does something useful rather than reporting "up to date".

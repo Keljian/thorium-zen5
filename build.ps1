@@ -365,39 +365,11 @@ function Invoke-NativeCapture {
     }
 }
 
-function Resolve-ChromiumStableTag {
-    <#
-    Returns the current Chromium STABLE release version for Windows (e.g.
-    "154.0.8037.17"), which is also the git tag name in chromium/src.
-
-    This project builds stock Chromium, not Thorium. That is a deliberate
-    change (2026-09-14): Thorium's tree pinned Chromium 138 via its own
-    upstream_version.sh while stable was 154 -- roughly a year of unapplied
-    upstream security fixes -- and its release tags (M144..M152) all pointed
-    at one stale commit, so there was no "newer Thorium" to track. What this
-    project actually needed from Thorium was never its overlay; it was the
-    Zen5 compiler targeting, which is ours and applies to stock Chromium
-    directly. See docs/ARCHITECTURE.md.
-
-    Tracking *stable* (not trunk) is the security-relevant choice: trunk is
-    whatever landed an hour ago and can be broken outright, while stable is
-    the branch Google ships CVE fixes on.
-    #>
-    $uri = "https://chromiumdash.appspot.com/fetch_releases?channel=Stable&platform=Windows&num=1"
-    try {
-        $resp = Invoke-RestMethod -Uri $uri -Headers @{ "User-Agent" = "thorium-zen5-build.ps1" } -UseBasicParsing
-    } catch {
-        throw "Failed to resolve the current Chromium stable version from $uri -- check network access: $_"
-    }
-    $version = @($resp)[0].version
-    if (-not $version) {
-        throw "chromiumdash returned no 'version' field for channel=Stable platform=Windows: $($resp | ConvertTo-Json -Compress -Depth 3)"
-    }
-    if ($version -notmatch '^\d+\.\d+\.\d+\.\d+$') {
-        throw "chromiumdash returned something that is not a Chromium version tag: '$version'"
-    }
-    return [string]$version
-}
+# Resolve-ChromiumStableTag / Test-ChromiumVersionIsNewer live in
+# scripts/ChromiumVersion.ps1 and are shared with update.ps1. They used to be
+# copy-pasted into both scripts; see that file for the downgrade bug that
+# duplication concealed.
+. (Join-Path $ScriptsDir "ChromiumVersion.ps1")
 
 function Get-PythonExe {
     <#
@@ -966,6 +938,41 @@ function Invoke-Test {
 # ---------------------------------------------------------------------------
 # analyze
 # ---------------------------------------------------------------------------
+function Assert-LlvmObjdump {
+    <#
+    Returns a path to llvm-objdump.exe, fetching it if absent.
+
+    Chromium's clang package does NOT ship llvm-objdump -- it is a separate
+    download ("llvmobjdump"), and third_party/llvm-build/ is gitignored inside
+    the Chromium checkout. Worse, tools/clang/scripts/update.py notes that
+    "updating the main clang package nukes the output dir", so any clang roll
+    during `build.ps1 sync` DELETES it again.
+
+    That made `analyze` a step that worked exactly once, on the machine where
+    someone had copied the binary in by hand, and broke silently on every
+    subsequent update -- precisely the kind of rot this project exists to avoid.
+
+    So fetch it the supported way, version-matched to the pinned clang, and do
+    it every time it is missing rather than assuming a previous run left it.
+    #>
+    $objdump = Join-Path $SrcDir "third_party\llvm-build\Release+Asserts\bin\llvm-objdump.exe"
+    if (Test-Path $objdump) { return $objdump }
+
+    Write-Log "llvm-objdump not present (Chromium's clang package excludes it, and a clang roll wipes it). Fetching the matching 'objdump' package."
+    $py = Get-PythonExe
+    Invoke-Logged -Exe $py -Arguments @(
+        (Join-Path $SrcDir "tools\clang\scripts\update.py"),
+        "--package=objdump"
+    ) -WorkingDirectory $SrcDir -EnvVars (Get-DepotToolsEnv)
+
+    if (-not (Test-Path $objdump)) {
+        throw ("llvm-objdump still missing at $objdump after running " +
+               "tools/clang/scripts/update.py --package=objdump. Fetch it manually or skip 'analyze'.")
+    }
+    Write-Log "llvm-objdump fetched to $objdump"
+    return $objdump
+}
+
 function Invoke-Analyze {
     Start-Log "analyze"
     $outDir = Join-Path $SrcDir "out\thorium-$Profile"
@@ -973,7 +980,7 @@ function Invoke-Analyze {
     if (-not (Test-Path $binary)) { $binary = Join-Path $outDir "thorium.exe" }
     if (-not (Test-Path $binary)) { throw "No built binary found in $outDir. Run '.\build.ps1 build -Profile $Profile' first." }
 
-    $objdump = Join-Path $SrcDir "third_party\llvm-build\Release+Asserts\bin\llvm-objdump.exe"
+    $objdump = Assert-LlvmObjdump
     $symbolizer = Join-Path $SrcDir "third_party\llvm-build\Release+Asserts\bin\llvm-symbolizer.exe"
     # Chromium emits "<file>.<ext>.pdb" (chrome.dll.pdb, thorium.exe.pdb), so
     # append rather than ChangeExtension -- ChangeExtension($binary,".dll.pdb")
