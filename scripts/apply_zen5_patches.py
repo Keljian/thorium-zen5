@@ -172,10 +172,42 @@ declare_args() {{
   # silent.
   zen5_mtune = "generic"
 
+  # Cap the SLP vectorizer's register size (bits) for CPU-targeted builds.
+  # "" leaves it at the target default.
+  #
+  # Works around an X86 instruction-selection gap in clang 24: with 512-bit
+  # vectors enabled the backend cannot select
+  #     v4i64 = zero_extend_vector_inreg
+  # and aborts. Isolated to the SLP vectorizer specifically -- see
+  # docs/TOOLCHAIN-BUGS.md BUG-3.
+  #
+  # Preferred over -mprefer-vector-width=256 because it is far narrower:
+  # measured on a file with both an _mm512 intrinsic and an auto-vectorizable
+  # loop, this emits zmm 38 / ymm 8 -- IDENTICAL to the unrestricted 512-bit
+  # build -- whereas prefer-vector-width=256 drops to zmm 6 / ymm 32. Loop
+  # vectorization and explicit intrinsics keep full 512-bit width; only
+  # straight-line SLP vectorization is capped.
+  #
+  # Applied as an LDFLAG under ThinLTO: the vectorizers run in the LTO
+  # backend (post-link), not the pre-link compile, so a cflag would not
+  # reach them. Applied as a cflag when ThinLTO is off.
+  #
+  # NOTE: -mllvm flags are NOT part of LLVM's ThinLTO cache key. After
+  # changing this you MUST delete out/<profile>/thinlto-cache or the link
+  # will silently reuse the previous codegen.
+  zen5_slp_max_reg_size = ""
+
+  # Escape hatches for bisecting toolchain problems (see TOOLCHAIN-BUGS.md).
   # Extra cflags appended to CPU-targeted builds, e.g. [ "-mno-avx512vnni" ].
   # Exists so an individual ISA feature can be bisected without editing this
   # file; see docs/TOOLCHAIN-BUGS.md.
   zen5_extra_target_cflags = []
+
+  # Extra ldflags appended to CPU-targeted builds, e.g.
+  # [ "-mllvm:-some-backend-flag" ]. Because the vectorizers and instruction
+  # selection run in the ThinLTO backend, link-time -mllvm flags are how you
+  # reach codegen in this build -- cflags do not get there.
+  zen5_extra_target_ldflags = []
 
   # Whether to also pass -march to the ThinLTO backend via -mllvm.
   #
@@ -218,6 +250,18 @@ TARGETING_BLOCK = '''
         cflags += [ "-mprefer-vector-width=$zen5_prefer_vector_width" ]
       }}
       cflags += zen5_extra_target_cflags
+      ldflags += zen5_extra_target_ldflags
+
+      if (zen5_slp_max_reg_size != "") {{
+        if (use_thin_lto) {{
+          ldflags += [ "-mllvm:-slp-max-reg-size=$zen5_slp_max_reg_size" ]
+        }} else {{
+          cflags += [
+            "-mllvm",
+            "-slp-max-reg-size=$zen5_slp_max_reg_size",
+          ]
+        }}
+      }}
     }}
 
     if (use_znver5) {{

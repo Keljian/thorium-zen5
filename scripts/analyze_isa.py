@@ -59,15 +59,50 @@ def run(cmd):
     return subprocess.run(cmd, capture_output=True, text=True, check=False)
 
 
-def disassemble(objdump: str, binary: str) -> str:
-    r = run([objdump, "-d", "--x86-asm-syntax=intel", "-M", "intel", binary])
-    if r.returncode != 0 or not r.stdout:
+def _objdump_arg_forms(objdump: str, binary: str):
+    return [
+        [objdump, "-d", "--x86-asm-syntax=intel", "-M", "intel", binary],
         # Some llvm-objdump builds want --disassemble instead of -d, or no -M intel
-        r = run([objdump, "--disassemble", "--x86-asm-syntax=intel", binary])
-    if r.returncode != 0:
-        print(f"ERROR running objdump: {r.stderr}", file=sys.stderr)
-        sys.exit(1)
-    return r.stdout
+        [objdump, "--disassemble", "--x86-asm-syntax=intel", binary],
+    ]
+
+
+def disassemble_lines(objdump: str, binary: str):
+    """Yield disassembly lines, STREAMING.
+
+    Chromium's chrome.dll is ~295 MB of code; its disassembly is on the order
+    of 10 GB of text. The previous implementation ran objdump with
+    capture_output=True and then called .splitlines() on the result, which
+    holds that entire output in memory twice and will thrash or OOM the
+    machine on the very binary this tool exists to analyse. (It worked only
+    because it had never been pointed at a real chrome.dll.)
+
+    So: pipe it, and never materialise more than one line at a time.
+    """
+    last_err = None
+    for cmd in _objdump_arg_forms(objdump, binary):
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, text=True, bufsize=1 << 20,
+        )
+        produced = False
+        for line in proc.stdout:
+            produced = True
+            yield line.rstrip("\n")
+        proc.stdout.close()
+        err = proc.stderr.read()
+        proc.stderr.close()
+        rc = proc.wait()
+        if produced and rc == 0:
+            return
+        last_err = err or f"exit={rc}"
+        if produced:
+            # Output but a bad exit code: report rather than silently re-running
+            # and double-counting everything we just yielded.
+            print(f"ERROR running objdump ({' '.join(cmd)}): {last_err}", file=sys.stderr)
+            sys.exit(1)
+    print(f"ERROR running objdump: {last_err}", file=sys.stderr)
+    sys.exit(1)
 
 
 ADDR_LINE_RE = re.compile(r"^\s*([0-9a-fA-F]+):\s+(?:[0-9a-fA-F]{2}\s+)*\s*([a-zA-Z0-9.]+)\s*(.*)$")
@@ -87,7 +122,10 @@ def classify(mnemonic: str, operands: str) -> list[str]:
     return hits
 
 
-def analyze(text: str) -> dict:
+MAX_SAMPLE_HITS = 2000
+
+
+def analyze(lines) -> dict:
     current_section = None
     bucket_counts = Counter()
     total_instructions = 0
@@ -95,7 +133,8 @@ def analyze(text: str) -> dict:
     ymm_instructions = 0
     per_address_hits = []  # for regions report: (addr, mnemonic, buckets)
 
-    for line in text.splitlines():
+    hit_count = 0
+    for line in lines:
         sec_match = SECTION_RE.match(line)
         if sec_match:
             current_section = sec_match.group(1)
@@ -113,11 +152,16 @@ def analyze(text: str) -> dict:
         for b in buckets:
             bucket_counts[b] += 1
         if buckets:
-            per_address_hits.append({
-                "section": current_section, "address": addr,
-                "mnemonic": mnemonic, "operands": operands.strip(),
-                "buckets": buckets,
-            })
+            hit_count += 1
+            # Cap the sample as we go. Previously this list grew to hold EVERY
+            # hit and was truncated only at the end -- on chrome.dll that is
+            # millions of dicts held live for no reason.
+            if len(per_address_hits) < MAX_SAMPLE_HITS:
+                per_address_hits.append({
+                    "section": current_section, "address": addr,
+                    "mnemonic": mnemonic, "operands": operands.strip(),
+                    "buckets": buckets,
+                })
 
     return {
         "total_instructions_disassembled": total_instructions,
@@ -125,8 +169,9 @@ def analyze(text: str) -> dict:
         "ymm_register_instructions": ymm_instructions,
         "bucket_counts": dict(bucket_counts),
         "avx512_total": sum(v for k, v in bucket_counts.items() if k.startswith("AVX512") or k == "unclassified_avx512_or_zmm"),
-        "sample_hits": per_address_hits[:2000],  # cap to keep JSON manageable; full count is in bucket_counts
-        "sample_hits_truncated": len(per_address_hits) > 2000,
+        "sample_hits": per_address_hits,  # capped while streaming; full totals are in bucket_counts
+        "sample_hits_truncated": hit_count > len(per_address_hits),
+        "total_hits": hit_count,
     }
 
 
@@ -161,8 +206,7 @@ def main():
         print(f"ERROR: binary not found: {binary}", file=sys.stderr)
         sys.exit(1)
 
-    text = disassemble(args.objdump, str(binary))
-    result = analyze(text)
+    result = analyze(disassemble_lines(args.objdump, str(binary)))
     result["binary"] = str(binary)
     result["label"] = args.label
     result["objdump"] = args.objdump
