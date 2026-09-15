@@ -35,10 +35,19 @@
 .PARAMETER Profile
     One of: baseline, zen5, generic-avx512. Default: zen5.
 
+.PARAMETER Target
+    Build only these ninja targets instead of chrome + mini_installer. Turns
+    the ~59,000-step full build into a ~2,500-step (~2 min) canary, which is
+    what makes toolchain bisection practical. See docs/TOOLCHAIN-BUGS.md.
+
 .EXAMPLE
     .\build.ps1 all
     .\build.ps1 build -Profile generic-avx512
     .\build.ps1 analyze -Profile zen5
+
+.EXAMPLE
+    # Fast canary for toolchain problems: links base under ThinLTO in ~2 min.
+    .\build.ps1 build -Profile zen5 -Target root_store_tool
 #>
 [CmdletBinding()]
 param(
@@ -54,6 +63,21 @@ param(
     [switch]$SkipTests,
     [string]$SpeedometerDir = $null,
     [switch]$Force,
+
+    # Build only these ninja targets instead of chrome + mini_installer.
+    #
+    # This exists because diagnosing a toolchain miscompile needs a FAST loop,
+    # and the full build is ~59,000 steps. net/tools/root_store_tool is ~2,500
+    # steps (~2 min) and still links base with ThinLTO + PGO + WPD, which is
+    # where this class of bug actually lives -- it is what isolated the
+    # -mtune=znver* bug in docs/TOOLCHAIN-BUGS.md. A canary that does not link
+    # under LTO is worthless here: the same files compile cleanly standalone
+    # under every -march/-mtune combination tested.
+    #
+    #   .\build.ps1 build -Profile zen5 -Target root_store_tool
+    #
+    # Skips the manifest step, since a partial build is not a release.
+    [string[]]$Target = @(),
 
     # Priority class for every child process the build spawns. Defaults to
     # BelowNormal so a multi-hour build leaves the machine usable: the build
@@ -891,6 +915,15 @@ function Invoke-Build {
     # own GN targets and do not exist here -- ninja would fail with "unknown
     # target". `chrome` builds the browser; `mini_installer` produces the
     # self-extracting installer our Inno Setup step unpacks.
+    if ($Target.Count -gt 0) {
+        Write-Log "Building profile '$Profile' with $jobs jobs -- TARGETS ONLY: $($Target -join ', ')"
+        Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") `
+            -Arguments (@("-C", "out\thorium-$Profile") + $Target + @("-j$jobs")) `
+            -WorkingDirectory $SrcDir -EnvVars $env
+        Write-Log "Target build complete. No manifest written -- a partial build is not a release."
+        return
+    }
+
     Write-Log "Building profile '$Profile' with $jobs jobs (autoninja chrome + mini_installer)."
 
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") `
