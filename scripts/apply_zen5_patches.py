@@ -6,47 +6,90 @@ Chromium checkout.
 Context
 -------
 Stock Chromium has NO x86 microarchitecture targeting. Verified directly
-against Chromium 154.0.8037.17: build/config/compiler/BUILD.gn (3259 lines)
-contains exactly one `-march=` reference and it is `-march=$arm_arch` for
-ARM. Everything x86 is built for a generic x86-64 baseline.
+against Chromium 154.0.8037.17: build/config/compiler/BUILD.gn contains
+exactly one `-march=` reference and it is `-march=$arm_arch` for ARM.
+Everything x86 is built for a generic x86-64 baseline.
 
-So this tool does not rewrite somebody else's hardcoded -march (that was the
-job when this project overlaid Thorium, which pinned
-`-mllvm:-march=skylake-avx512`). It ADDS:
+So this tool does not rewrite somebody else's hardcoded -march. It ADDS:
 
-  1. a declare_args() block defining `use_znver5` and `use_generic_avx512`
-  2. a targeting block inside config("compiler") that emits
-     -march/-mtune for x64 Windows clang builds
+  1. a declare_args() block defining the zen5_* arguments
+  2. a targeting block inside config("compiler") that emits -march/-mtune
+     for x64 Windows clang builds
 
-Why the ThinLTO backend flag is required
-----------------------------------------
-Both a compile flag (-march) and a link-time backend flag
-(-mllvm:-march) are set, deliberately.
+THE TOOLCHAIN BUG: -mtune=znver* breaks ThinLTO
+-----------------------------------------------
+On this toolchain (Chromium 154, bundled clang 24.0.0git, Windows x64,
+ThinLTO, is_official_build) the AMD Zen SCHEDULING MODEL miscompiles in the
+LTO backend. It is not an AVX-512 problem and not a znver5 problem.
 
-An earlier version of this file set only the compile flags, reasoning that
-clang's per-function `target-cpu` / `target-features` attributes in the
-bitcode would carry through LTO codegen. That was wrong, and the failure is
-not subtle: on Chromium 154, linking transport_security_state_generator.exe
-died with undefined symbols for base's own inline functions
-(logging::LogMessage, logging::GetLastSystemErrorCode, perfetto::...) even
-though they live in obj/base/base.lib. The LTO backend was codegening at a
-different default CPU than the bitcode was built for, so definitions that
-could not be inlined across that feature mismatch were dropped.
+Isolated by holding the instruction set constant and varying only -mtune,
+building net/tools/root_store_tool (2.5k steps, ~2 min) for each cell:
 
-Isolated by building the identical configuration with only use_znver5
-flipped to false: that linked cleanly in 1m44s. Thorium's own AVX-512
-flavour passed -mllvm:-march=skylake-avx512 for the same reason, which also
-confirms the spelling lld-link accepts here.
+    -march              -mtune            result
+    ------------------  ----------------  ---------------------------
+    skylake-avx512      skylake-avx512    PASS
+    skylake-avx512      znver4            FAIL
+    znver4 (AVX512 off) znver4            FAIL   <- entire AVX-512
+                                                    extension set disabled
+                                                    via -mno-*, still fails
+    znver4              skylake-avx512    PASS
+    znver5              skylake-avx512    PASS
+    znver4              generic           PASS
+    znver5              generic           PASS
 
-Adding the backend flag got much further (2228 steps vs 436) but then hit a
-SEPARATE and more fundamental problem: -march=znver5 itself miscompiles in
-this toolchain, emitting malformed Windows SEH unwind data. See the
-zen5_march arg below for the measurements that isolated it, and why the
-default target is znver4.
+Every failure has AMD scheduling; every pass does not. The instruction set
+is irrelevant -- the third row keeps -mtune=znver4 with every AVX-512
+extension switched off and still fails.
 
-scripts/analyze_isa.py still measures the AVX-512 actually present in the
-finished binary -- the flags being accepted is not the same as them paying
-off, and that remains a measured question.
+The failure has two faces, both from the LTO backend:
+  1. lld-link: error: <unknown>:0: Missing .seh_endepilogue in <fn>
+     -- malformed Windows SEH unwind data.
+  2. ~20 undefined symbols, all from base/logging.cc and its perfetto
+     trace-event companions, referenced by whole-program-devirtualization
+     branch funnels (__typeid_..._branch_funnel).
+These are INDEPENDENT: disabling Windows unwind v2 removes (1) and leaves
+(2) untouched. Fixing -mtune removes both, which is why no unwind-v2
+workaround is needed (zen5_winunwindv2 defaults to "", clang's default).
+
+WHY -mtune=generic AND NOT -mtune=skylake-avx512
+------------------------------------------------
+Both build. Only one of them actually emits 512-bit code. prefer-256-bit is
+a TUNING feature in LLVM, so an Intel -mtune silently suppresses all
+512-bit vectorization. Measured by counting registers in the emitted
+assembly for a vectorizable loop:
+
+    -march / -mtune                 zmm    ymm
+    ------------------------------  ----   ----
+    znver5 / znver5  (unbuildable)    72     18
+    znver5 / skylake-avx512            0     72   <- no 512-bit code at all
+    znver5 / generic                  72     18   <- identical to intended
+    skylake-avx512 / skylake-avx512    0     72
+    (stock, no -march)                 0      0
+
+-mtune=generic reproduces the intended codegen exactly. What is lost is
+Zen 5's instruction scheduling model only -- the full ISA, 512-bit
+vectorization, PGO and ThinLTO are all intact.
+
+Set zen5_mtune back to "znver5" once LLVM fixes this; the failure is loud
+(link error), never silent.
+
+Corrections to earlier revisions of this file
+---------------------------------------------
+Two claims previously asserted here were wrong and have been retracted:
+  * "-march=znver5 miscompiles, use znver4" -- no. znver4 fails identically.
+    The original evidence came from a single small link target that happened
+    not to contain the triggering code.
+  * "the ThinLTO backend flag -mllvm:-march is REQUIRED" -- no. Re-linking
+    the same target with it removed, against a COLD ThinLTO cache,
+    reproduces the failure identically. See zen5_lto_backend_march.
+
+Both errors traced to the same methodological trap: -mllvm flags are NOT
+part of LLVM's ThinLTO cache key, so changing one and relinking silently
+reuses cached codegen and "reproduces" the previous result in ~3 seconds.
+Every measurement above used a fresh per-variant cache directory.
+
+scripts/analyze_isa.py measures the AVX-512 actually present in the
+finished binary -- flags being accepted is not the same as them paying off.
 
 Exit codes
 ----------
@@ -55,6 +98,7 @@ Exit codes
        build.ps1 configure treats this as a hard stop so no build is ever
        attempted from a half-patched tree.
 """
+
 import argparse
 import difflib
 import sys
@@ -64,48 +108,85 @@ MARKER = "thorium-zen5: Zen 5 CPU targeting"
 
 DECLARE_ARGS_BLOCK = '''# --- {marker} (declare_args) ---
 # Added by thorium-zen5. Stock Chromium has no microarchitecture-targeting
-# argument; these are ours. Both default to false so an unpatched-intent
-# build (the "baseline" profile) is byte-for-byte stock behaviour.
+# argument; these are ours. All default to the values that reproduce stock
+# behaviour so the "baseline" profile is byte-for-byte unmodified Chromium.
 declare_args() {{
   # Target AMD Zen 5 (Ryzen 9 9950X and family) specifically: lets Clang's
-  # own znver5 model select the complete ISA -- including AVX512VNNI, VBMI,
-  # VBMI2, BITALG, VPOPCNTDQ, IFMA, BF16, GFNI, VAES, VPCLMULQDQ -- and Zen 5
+  # own model select the complete ISA -- including AVX512VNNI, VBMI, VBMI2,
+  # BITALG, VPOPCNTDQ, IFMA, BF16, GFNI, VAES, VPCLMULQDQ -- and AMD
   # scheduling, instead of a hand-maintained feature flag list.
   # A binary built with this WILL fault on any pre-Zen5 CPU. That is intended;
   # backward compatibility is explicitly not a goal of this project.
   use_znver5 = false
 
-  # Which -march the zen5 profile actually emits.
+  # Which -march the zen5 profile emits -- the INSTRUCTION SET.
   #
-  # Defaults to znver4, NOT znver5, and that is deliberate. Measured on this
-  # toolchain (Chromium 154, bundled clang 24.0.0git, Windows, ThinLTO,
-  # is_official_build): -march=znver5 miscompiles. Linking
-  # transport_security_state_generator.exe fails with
-  #     lld-link: error: <unknown>:0: Missing .seh_endepilogue in
-  #               ?GetVlogLevelHelper@logging@@YAHPEBD_K@Z
-  # plus dropped `vector deleting dtor' thunks -- malformed Windows SEH unwind
-  # data out of the LTO backend. Isolated by building the identical target
-  # against each candidate:
-  #     (stock, no -march)  -> builds
-  #     skylake-avx512      -> builds, 1m48s, 0 errors
-  #     znver4              -> builds, 1m39s, 0 errors
-  #     znver5              -> FAILS
-  # So it is znver5 specifically, not AVX-512 and not AMD targeting.
-  #
-  # znver4 is the right fallback rather than a climbdown: Zen 4 and Zen 5 share
-  # essentially the same AVX-512 feature set (VNNI, VBMI, VBMI2, BITALG,
-  # VPOPCNTDQ, IFMA, BF16, GFNI, VAES, VPCLMULQDQ), so the full instruction set
-  # is still enabled. What is lost is Zen 5's scheduling model and its full
-  # 512-bit datapath assumptions -- tuning, not capability.
-  #
-  # Set this to "znver5" to retry once the toolchain moves; the failure is loud
-  # (link error), never silent.
-  zen5_march = "znver4"
+  # znver5 is safe. The toolchain bug documented at the top of this file is
+  # in the -mtune scheduling model, not the ISA: znver4 and znver5 behave
+  # identically, and disabling the entire AVX-512 extension set does not
+  # avoid it. So this targets Zen 5 fully.
+  zen5_march = "znver5"
 
   # Vendor-neutral AVX-512 (the F/CD/VL/BW/DQ subset common to all AVX-512
-  # parts, with generic AVX-512 scheduling). Exists purely as the comparison
-  # point for use_znver5 in scripts/compare_builds.py.
+  # parts). NOTE: measured to emit NO 512-bit code at all -- clang defaults
+  # skylake-avx512 to prefer-vector-width=256. Kept only as a comparison
+  # point for scripts/compare_builds.py; it is not "the AVX-512 build".
   use_generic_avx512 = false
+
+  # Windows x64 unwind v2 mode for CPU-targeted builds: "", "disabled",
+  # "best-effort" or "required". "" leaves clang's default in place.
+  #
+  # Defaults to "" -- NO workaround. This exists because the
+  # "Missing .seh_endepilogue" half of the -mtune=znver* bug can be
+  # suppressed by setting this to "disabled", and that was briefly the
+  # intended fix. It is not needed: with zen5_mtune = "generic" the build
+  # is clean at clang's DEFAULT unwind-v2 setting (verified -- the same
+  # canary target builds exit=0 with this at "" and at "disabled").
+  #
+  # Keeping the default means we do not switch off a Windows feature we do
+  # not have to. Unwind v2 is unwind METADATA (it records epilogue
+  # boundaries so the OS unwinder need not emulate epilogues) rather than an
+  # exploit mitigation, but it is adjacent to CET shadow-stack unwinding and
+  # this build links /CETCOMPAT, so leaving it alone is the conservative
+  # choice. Retained as a knob only for diagnosing this class of failure.
+  zen5_winunwindv2 = ""
+
+  # Max vector width for CPU-targeted builds ("" = the target's default,
+  # otherwise e.g. "256" or "512").
+  zen5_prefer_vector_width = ""
+
+  # -mtune for CPU-targeted builds -- the SCHEDULING MODEL.
+  # "" means "same as zen5_march".
+  #
+  # MUST NOT be znver4/znver5 on this toolchain: that is the actual bug (see
+  # the header of this file for the full matrix). "generic" is the correct
+  # workaround rather than an Intel -mtune, because prefer-256-bit is a
+  # TUNING feature -- -mtune=skylake-avx512 builds fine but emits ZERO
+  # 512-bit instructions, silently discarding the entire point of the build.
+  # "generic" reproduces the intended znver5 codegen exactly (measured:
+  # zmm 72 / ymm 18, same as znver5/znver5).
+  #
+  # Cost of the workaround: Zen 5 instruction scheduling only. The ISA,
+  # 512-bit vectorization, PGO and ThinLTO are unaffected. Restore to
+  # "znver5" once LLVM fixes this -- the failure is a link error, not
+  # silent.
+  zen5_mtune = "generic"
+
+  # Extra cflags appended to CPU-targeted builds, e.g. [ "-mno-avx512vnni" ].
+  # Exists so an individual ISA feature can be bisected without editing this
+  # file; see docs/TOOLCHAIN-BUGS.md.
+  zen5_extra_target_cflags = []
+
+  # Whether to also pass -march to the ThinLTO backend via -mllvm.
+  #
+  # UNVERIFIED. An earlier revision of this file asserted this was REQUIRED,
+  # on the evidence of a link that failed without it. That evidence has since
+  # been retracted: re-linking the same target with the flag removed and a
+  # COLD ThinLTO cache reproduces the failure identically, so the flag was
+  # never what fixed it. It is kept on because the bitcode's per-function
+  # target-cpu attributes are believed sufficient but that has not been
+  # measured here; settle it with scripts/analyze_isa.py, not by reasoning.
+  zen5_lto_backend_march = true
 }}
 
 '''
@@ -118,8 +199,7 @@ TARGETING_BLOCK = '''
   # this is NOT target-only. On a non-cross Windows x64 build the host and
   # target toolchains coincide, so is_a_target_toolchain is also true for
   # win_clang_x64_host_* and the rust host build tools, and they receive
-  # -march=znver5 as well (84 refs in the main toolchain.ninja, a handful in
-  # the host ones). That is acceptable HERE only because those tools are
+  # these flags as well. That is acceptable HERE only because those tools are
   # built and run on the same Zen 5 machine, and backward compatibility is
   # explicitly not a goal of this project. Do not copy this to a cross build
   # or to anything that ships build tools to other machines.
@@ -127,34 +207,41 @@ TARGETING_BLOCK = '''
     assert(!(use_znver5 && use_generic_avx512),
            "use_znver5 and use_generic_avx512 are mutually exclusive -- " +
            "pick one; they set conflicting -march values.")
+
+    # Toolchain workarounds, applied ONLY when CPU targeting is on so the
+    # baseline profile stays byte-for-byte stock. See docs/TOOLCHAIN-BUGS.md.
+    if (use_znver5 || use_generic_avx512) {{
+      if (zen5_winunwindv2 != "") {{
+        cflags += [ "/clang:-fwinx64-eh-unwindv2=$zen5_winunwindv2" ]
+      }}
+      if (zen5_prefer_vector_width != "") {{
+        cflags += [ "-mprefer-vector-width=$zen5_prefer_vector_width" ]
+      }}
+      cflags += zen5_extra_target_cflags
+    }}
+
     if (use_znver5) {{
+      _mtune = zen5_march
+      if (zen5_mtune != "") {{
+        _mtune = zen5_mtune
+      }}
       cflags += [
         "-march=$zen5_march",
-        "-mtune=$zen5_march",
+        "-mtune=$_mtune",
       ]
-      # The ThinLTO backend MUST be told the same target.
-      #
-      # This was originally left out on the theory that clang's per-function
-      # target-cpu/target-features attributes in the bitcode would be enough.
-      # They are not. Verified on Chromium 154: without this, linking
-      # transport_security_state_generator.exe fails with undefined symbols for
-      # base's own inline functions (logging::LogMessage, perfetto::...) because
-      # the LTO backend codegens at a different default CPU than the bitcode was
-      # compiled for, and definitions that cannot be inlined across the feature
-      # mismatch get dropped. Flipping use_znver5 off made the identical link
-      # succeed, which is what isolated it.
-      #
-      # This mirrors what Thorium's AVX-512 flavour did (-mllvm:-march=
-      # skylake-avx512), so the spelling is known-good for lld-link here.
-      if (use_thin_lto) {{
+      if (use_thin_lto && zen5_lto_backend_march) {{
         ldflags += [ "-mllvm:-march=$zen5_march" ]
       }}
     }} else if (use_generic_avx512) {{
+      _mtune = "skylake-avx512"
+      if (zen5_mtune != "") {{
+        _mtune = zen5_mtune
+      }}
       cflags += [
         "-march=skylake-avx512",
-        "-mtune=skylake-avx512",
+        "-mtune=$_mtune",
       ]
-      if (use_thin_lto) {{
+      if (use_thin_lto && zen5_lto_backend_march) {{
         ldflags += [ "-mllvm:-march=skylake-avx512" ]
       }}
     }}

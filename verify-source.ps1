@@ -155,8 +155,13 @@ if (Test-Path $argsGnPath) {
     $result.compiler_flags = $flags
     $result.target_cpu = $flags["target_cpu"]
 
+    # zen5_mtune is asserted, not just recorded: -mtune=znver4/znver5
+    # miscompiles under ThinLTO on this toolchain, and -mtune=skylake-avx512
+    # builds but silently emits ZERO 512-bit instructions. Either mistake is
+    # invisible in a successful build, so it is checked here rather than
+    # discovered later in a benchmark. See gn/win_zen5_args.gn.
     $expectations = switch ($Profile) {
-        "zen5"           { @{ use_znver5 = "true";  use_generic_avx512 = "false"; target_cpu = '"x64"' } }
+        "zen5"           { @{ use_znver5 = "true";  use_generic_avx512 = "false"; target_cpu = '"x64"'; zen5_march = '"znver5"'; zen5_mtune = '"generic"' } }
         "generic-avx512" { @{ use_znver5 = "false"; use_generic_avx512 = "true";  target_cpu = '"x64"' } }
         "baseline"       { @{ use_znver5 = "false"; use_generic_avx512 = "false"; target_cpu = '"x64"' } }
     }

@@ -1,16 +1,46 @@
 # Profile: zen5 -- AMD Ryzen 9 9950X (Zen 5), Windows x64, STOCK CHROMIUM.
 #
-# use_znver5 is an argument THIS PROJECT adds to Chromium (see
-# patches/zen5 and scripts/apply_zen5_patches.py). Stock Chromium has no
-# microarchitecture-targeting arg at all: it builds a generic x86-64
-# baseline. Setting this emits -march=znver5 -mtune=znver5 for the x64
-# Windows compile and, critically, for the ThinLTO backend's codegen and
-# scheduling -- letting Clang's own znver5 model select the complete ISA
-# (including AVX512VNNI/VBMI/VBMI2/BITALG/VPOPCNTDQ/IFMA/BF16, GFNI, VAES,
-# VPCLMULQDQ) and Zen 5 scheduling, rather than a hand-maintained flag list.
+# use_znver5, zen5_march and zen5_mtune are arguments THIS PROJECT adds to
+# Chromium (see patches/zen5 and scripts/apply_zen5_patches.py). Stock
+# Chromium has no microarchitecture-targeting arg at all: it builds a
+# generic x86-64 baseline.
+#
+# This emits -march=znver5 for the x64 Windows compile, letting Clang's own
+# znver5 model select the complete ISA -- AVX512VNNI/VBMI/VBMI2/BITALG/
+# VPOPCNTDQ/IFMA/BF16, GFNI, VAES, VPCLMULQDQ -- rather than a
+# hand-maintained feature flag list.
 #
 # Backward CPU compatibility is explicitly NOT a goal: a binary built this
 # way will fault with an illegal instruction on any pre-Zen5 machine.
+#
+# WHY -mtune IS NOT znver5
+# ------------------------
+# -mtune=znver4/znver5 MISCOMPILES under ThinLTO on this toolchain
+# (Chromium 154, clang 24.0.0git, Windows x64, is_official_build). It is a
+# SCHEDULER bug, not an ISA one: holding the instruction set fixed and
+# varying only -mtune reproduces it exactly, and disabling every AVX-512
+# extension while keeping -mtune=znver4 still fails. Full matrix and the
+# two failure signatures are documented in scripts/apply_zen5_patches.py
+# and docs/TOOLCHAIN-BUGS.md.
+#
+# "generic" specifically -- NOT an Intel -mtune. prefer-256-bit is a TUNING
+# feature, so -mtune=skylake-avx512 builds cleanly but emits ZERO 512-bit
+# instructions, which would silently discard the point of this profile.
+# Measured on a vectorizable loop:
+#     znver5 / znver5           zmm 72  ymm 18   (intended; unbuildable)
+#     znver5 / generic          zmm 72  ymm 18   (what we ship)
+#     znver5 / skylake-avx512   zmm  0  ymm 72   (no 512-bit code at all)
+#
+# We therefore lose Zen 5 instruction SCHEDULING only. The ISA, 512-bit
+# vectorization, PGO and ThinLTO are all intact. Set zen5_mtune back to
+# "znver5" once LLVM fixes this; the failure is a loud link error.
+#
+# These two are pinned explicitly rather than left to the declare_args
+# defaults so that args.gn records what was actually built, and so
+# verify-source.ps1 can assert them.
 
 use_znver5 = true
 use_generic_avx512 = false
+
+zen5_march = "znver5"
+zen5_mtune = "generic"
