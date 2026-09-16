@@ -61,7 +61,59 @@
 # (llvmorg-24-init-7747-g62397f8b), so do not expect this to age out soon.
 # Our findings are attached to the upstream issue.
 
-zen5_extra_target_ldflags = [ "-mllvm:-enable-tail-merge=false" ]
+# ThinLTO backend knobs, appended after Chromium's own values.
+#
+# Chromium already passes -mllvm:-import-instr-limit=30 and /opt:lldlto=2 on
+# every link. Both of ours come later on the command line and win: LLVM's
+# cl::opt takes the last occurrence and lld takes the last /opt:lldlto.
+# Verified against this checkout's own lld-link by passing each option twice --
+# both links exited 0 with no diagnostic, so these override rather than
+# conflict.
+#
+#   import-instr-limit=100  more cross-module inlining than Chromium's 30,
+#                           which is set for BUILD TIME on a fleet, not for
+#                           single-machine throughput. Paid for in link time
+#                           and binary size.
+#   /opt:lldlto=3           LTO codegen optimization level, up from 2.
+#
+# UNMEASURED. Both are plausible wins and neither is established here; treat
+# the numbers in docs/BENCHMARKS.md as the authority once they exist. If they
+# do not pay, delete these two lines -- there is no other coupling.
+#
+# WARNING: -mllvm flags are NOT part of LLVM's ThinLTO cache key. After
+# changing these, delete out/thorium-zen5/thinlto-cache or the link silently
+# reuses the previous codegen and the A/B measures nothing.
+zen5_extra_target_ldflags = [
+  "-mllvm:-enable-tail-merge=false",
+  "-mllvm:-import-instr-limit=100",
+  "/opt:lldlto=3",
+]
+
+# The ThinLTO backend -march flag is a NO-OP. Measured, not assumed.
+#
+# -march and -mcpu are different LLVM options. --march=<string> is
+# "Architecture to generate code for", from CommandFlags.cpp; --mcpu=<cpu-name>
+# is the one that names a processor. lld's LTO config takes its CPU from -mcpu
+# and never reads -march. Probed against this checkout's own linker:
+#
+#   lld-link ... -mllvm:-march=bogus123   -> exit 0, no diagnostic at all
+#   lld-link ... -mllvm:-mcpu=bogus123    -> "'bogus123' is not a recognized
+#                                             processor for this target"
+#
+# An invalid -mcpu is caught; an invalid -march is not even looked at. The flag
+# never did anything, which cost nothing, because the per-function target-cpu
+# attributes clang bakes into the bitcode are what the ThinLTO backend actually
+# honours -- that is why the ISA report shows 331,405 ZMM instructions with
+# this flag doing nothing at all.
+#
+# Turned off because a flag that is silently ignored, in a position that is NOT
+# part of the ThinLTO cache key, is exactly how this project previously reached
+# two wrong conclusions about its own toolchain.
+#
+# Do not "fix" it by switching to -mllvm:-mcpu=znver5: that would reapply Zen
+# scheduling across the whole LTO backend, which is the trigger for
+# llvm#199290, and the cflags already set tune-cpu per function.
+zen5_lto_backend_march = false
 
 # These two are pinned explicitly rather than left to the declare_args
 # defaults so that args.gn records what was actually built, and so

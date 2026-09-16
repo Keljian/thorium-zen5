@@ -1,10 +1,23 @@
 # Profile: baseline -- completely unmodified stock Chromium.
 #
-# Neither of this project's CPU-targeting args is set, so the tree is built
-# exactly as upstream ships it (generic x86-64 baseline, SSE3-era). No zen5
-# patches are applied to the source for this profile at all -- build.ps1
-# configure skips them -- so this is a true reference point for
-# scripts/compare_builds.py on binary size, ISA content and benchmarks.
-
-use_znver5 = false
-use_generic_avx512 = false
+# The reference point for scripts/compare_builds.py on binary size, ISA content
+# and benchmarks: generic x86-64, no microarchitecture targeting at all, which
+# is what upstream ships.
+#
+# THIS FILE DELIBERATELY SETS NOTHING.
+#
+# It used to set use_znver5 = false and use_generic_avx512 = false explicitly.
+# Those arguments do not exist in stock Chromium -- they are added by
+# scripts/apply_zen5_patches.py -- and build.ps1 configure skips the patcher
+# entirely for this profile. So on a freshly synced tree, where the patch has
+# been discarded by `git checkout -f`, gn would hard-error:
+#
+#     Unknown build argument 'use_znver5'
+#
+# It only worked at all when a previous zen5 configure had left the patch in
+# the tree, which is precisely the coupling this profile exists to avoid.
+#
+# Naming nothing is also correct on a tree that IS still patched: every
+# argument the patch declares defaults to the value that reproduces stock
+# behaviour, so a patched tree with none of them set compiles identically to an
+# unpatched one. Either way this profile is stock, which is the whole point.
