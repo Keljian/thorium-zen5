@@ -58,6 +58,14 @@ param(
     [ValidatePattern('^\d{1,2}:\d{2}$')]
     [string]$At = "03:00",
 
+    # Run the build even when nobody is logged on. This needs an S4U principal,
+    # which Task Scheduler will only register from an ELEVATED shell: without
+    # elevation it fails with "Access is denied" (HRESULT 0x80070005), observed
+    # on rohansdesktopry 2026-09-16. Without this switch the build task runs as
+    # an ordinary interactive task, which is fine on a desktop that stays
+    # logged in and needs no elevation at all.
+    [switch]$RunWhenLoggedOff,
+
     [switch]$Unregister
 )
 
@@ -103,12 +111,26 @@ $buildSettings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -MultipleInstances IgnoreNew
 
-# S4U: runs whether or not you are logged on, without storing a password and
-# without needing network credentials. The build touches only local files and
-# HTTPS, so it does not need the network-authenticated token a stored-password
-# logon would give it.
-$buildPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-    -LogonType S4U -RunLevel Limited
+# RunLevel Limited either way: nothing in the pipeline needs admin, and an
+# unattended multi-hour build is the last thing that should run elevated.
+#
+# S4U runs whether or not you are logged on, without storing a password, but
+# registering an S4U principal itself requires an elevated shell. Interactive
+# is the default so the common case needs no elevation; -RunWhenLoggedOff opts
+# into S4U and says plainly what it costs.
+$me = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+if ($RunWhenLoggedOff) {
+    $elevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+    if (-not $elevated) {
+        throw ("-RunWhenLoggedOff registers an S4U task, which Task Scheduler only allows from an " +
+               "elevated shell (it fails with 'Access is denied' otherwise). Re-run this script as " +
+               "Administrator, or drop the switch to register an ordinary interactive task.")
+    }
+    $buildPrincipal = New-ScheduledTaskPrincipal -UserId $me -LogonType S4U -RunLevel Limited
+} else {
+    $buildPrincipal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
+}
 
 # ---------------------------------------------------------------------------
 # Task 2: offer
@@ -116,13 +138,19 @@ $buildPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.Window
 $offerAction = New-ScheduledTaskAction -Execute $PwshExe -WorkingDirectory $RepoRoot `
     -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Profile {1}' -f $CheckPs1, $Profile)
 
-# Logon plus a repeating 4-hour trigger. The repetition is attached to a
-# once-trigger starting a minute from now rather than to the logon trigger,
-# because a repetition on a logon trigger only repeats within that logon
-# session and stops looking like it works after the first sleep/resume.
-$offerLogon = New-ScheduledTaskTrigger -AtLogOn -User ([Security.Principal.WindowsIdentity]::GetCurrent().Name)
-$offerRepeat = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) `
-    -RepetitionInterval (New-TimeSpan -Hours 4) -RepetitionDuration ([TimeSpan]::MaxValue)
+# Logon, plus a daily trigger that repeats every 4 hours for 24 hours.
+#
+# NOT -RepetitionDuration ([TimeSpan]::MaxValue): that serialises to
+# P99999999DT23H59M59S, which Task Scheduler rejects outright with "The task
+# XML contains a value which is incorrectly formatted or out of range"
+# (HRESULT 0x80041318), observed on rohansdesktopry 2026-09-16. A daily
+# trigger carrying a 24-hour repetition window is the bounded equivalent and
+# repeats forever because the trigger itself recurs daily.
+$offerLogon = New-ScheduledTaskTrigger -AtLogOn -User $me
+$offerRepeat = New-ScheduledTaskTrigger -Daily -At $At
+$offerRepeat.Repetition = (New-ScheduledTaskTrigger -Once -At $At `
+    -RepetitionInterval (New-TimeSpan -Hours 4) `
+    -RepetitionDuration (New-TimeSpan -Hours 24)).Repetition
 
 $offerSettings = New-ScheduledTaskSettingsSet `
     -AllowStartIfOnBatteries `
@@ -133,8 +161,7 @@ $offerSettings = New-ScheduledTaskSettingsSet `
 
 # Interactive, deliberately: a toast raised from a non-interactive session is
 # never displayed to anyone.
-$offerPrincipal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) `
-    -LogonType Interactive -RunLevel Limited
+$offerPrincipal = New-ScheduledTaskPrincipal -UserId $me -LogonType Interactive -RunLevel Limited
 
 # ---------------------------------------------------------------------------
 if ($PSCmdlet.ShouldProcess($BuildTask, "Register scheduled task (daily at $At)")) {
@@ -152,5 +179,5 @@ if ($PSCmdlet.ShouldProcess($OfferTask, "Register scheduled task (at logon, then
 }
 
 Write-Host ""
-Write-Host "Run scripts\Register-ThoriumUpdateNotifier.ps1 once as well, or the toast will not appear."
+Write-Host "Nothing else to register: the checker raises the notification itself."
 Write-Host "Inspect with: Get-ScheduledTask -TaskName 'Thorium Zen5*' | Format-List TaskName,State"

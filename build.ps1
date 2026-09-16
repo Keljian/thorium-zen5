@@ -1101,6 +1101,12 @@ function Expand-MiniInstaller([string]$MiniInstallerPath) {
     # directory that actually contains the browser executable.
     $exeFile = Get-ChildItem $stage2 -Recurse -Include "thorium.exe","chrome.exe" | Select-Object -First 1
     if (-not $exeFile) { throw "Could not locate thorium.exe/chrome.exe inside extracted chrome.7z." }
+    # Chrome's own layout is kept as chrome.7z ships it: chrome.exe at the top
+    # with the payload in a <version>\ subfolder. An earlier revision flattened
+    # this, on the theory that the nested form was why the installed browser
+    # would not start. That theory was wrong and the change has been reverted;
+    # see installer/README.md "Install location" for what the cause actually
+    # was and how it was isolated.
 
     Remove-Item $stage1 -Recurse -Force -ErrorAction SilentlyContinue
     return @{ AppFilesDir = $exeFile.Directory.FullName; MainExeName = $exeFile.Name }
@@ -1162,8 +1168,14 @@ function Invoke-Installer {
     }
     $releaseDir = Get-LatestReleaseDir
     if ($releaseDir) {
-        Move-Item $setupExe (Join-Path $releaseDir (Split-Path $setupExe -Leaf)) -Force
-        Write-Log "Installer built and moved into $releaseDir"
+        # .FullName, not the DirectoryInfo itself. Join-Path stringifies a
+        # DirectoryInfo via ToString(), which returns the path AS CONSTRUCTED --
+        # relative, for a Get-ChildItem -Filter result -- so the destination
+        # resolved against the caller's working directory instead, and Move-Item
+        # failed with "Could not find a part of the path" AFTER a successful
+        # 63-second compile. Observed on rohansdesktopry 2026-09-16.
+        Move-Item $setupExe (Join-Path $releaseDir.FullName (Split-Path $setupExe -Leaf)) -Force
+        Write-Log "Installer built and moved into $($releaseDir.FullName)"
     } else {
         Write-Log "Installer built at $setupExe (no packaged release folder found to move it into -- run 'package' first)." "WARN"
     }

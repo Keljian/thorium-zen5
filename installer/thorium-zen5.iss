@@ -52,7 +52,17 @@ AppVersion={#ThoriumZen5Version}
 AppPublisher=Personal build (unofficial; not affiliated with Google, the Chromium Authors, or Alex313031/Thorium)
 AppPublisherURL=https://github.com/Keljian/thorium-zen5
 VersionInfoDescription=Thorium Zen5 -- personal AMD Ryzen 9950X (Zen 5 / AVX-512) optimized Chromium/Thorium build [{#ProfileName}]
-DefaultDirName={localappdata}\ThoriumZen5\Application
+; INSTALL LOCATION: under the user profile, NOT under AppData.
+; On this machine, a Chromium build installed anywhere beneath
+; %LOCALAPPDATA% or %APPDATA% fails to start with
+;   "The application has failed to start because its side-by-side
+;    configuration is incorrect"
+; and Event 33: Activation context generation failed, Dependent Assembly
+; <version> could not be found. See installer/README.md "Install location"
+; for the isolation: identical bytes run from %USERPROFILE%, from
+; %LOCALAPPDATA%\Temp and from C:\thorium, and fail from every other
+; AppData path, whatever the internal layout.
+DefaultDirName={%USERPROFILE}\ThoriumZen5\Application
 DefaultGroupName=Thorium Zen5
 DisableProgramGroupPage=yes
 OutputDir={#OutputDir}

@@ -31,7 +31,8 @@
 
 .PARAMETER Install
     Skip the check UI and install the newest available build silently. This is
-    the protocol handler's entry point; see Register-ThoriumUpdateNotifier.ps1.
+    what the notification's click handler calls, and it is also the way to
+    install from a terminal without waiting for a notification.
 
 .PARAMETER Quiet
     No console output and no toast. Sets the exit code only, for a scheduled
@@ -57,21 +58,16 @@ param(
     [switch]$Install,
     [switch]$Quiet,
 
-    # The protocol handler appends the activating URI as a positional argument
-    # (thorium-zen5-update:install when the toast's button was clicked,
-    # thorium-zen5-update:show when the toast body was). Without a parameter to
-    # land in, PowerShell rejects the whole call with "A positional parameter
-    # cannot be found that accepts argument ...", and a toast button that
-    # silently does nothing is worse than no button.
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$ProtocolArgs
+    # How long to leave the notification up waiting for a click. The scheduled
+    # task that runs this has its own 10-minute execution limit, so keep this
+    # comfortably under it.
+    [int]$TimeoutMinutes = 5
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot    = Split-Path -Parent $PSScriptRoot
 $ReleasesDir = Join-Path $RepoRoot "releases"
 $RegKey      = "HKCU:\Software\ThoriumZen5"
-$AppId       = "ThoriumZen5.UpdateNotifier"
 
 function Say([string]$m) { if (-not $Quiet) { Write-Host $m } }
 
@@ -203,47 +199,101 @@ function Test-IsNewer($Available, $Installed) {
 }
 
 # ---------------------------------------------------------------------------
-# Toast
+# Notification
 # ---------------------------------------------------------------------------
-function Show-UpdateToast($Available, $Installed) {
+function Show-UpdateNotification {
     <#
-    A toast needs a registered AppUserModelID or Windows drops it silently.
-    Register-ThoriumUpdateNotifier.ps1 creates one under HKCU. If it has not
-    been run, fall back to the console rather than appearing to have done
-    something that did not happen.
+    Returns $true if the user asked to install.
+
+    WHY THIS IS A NotifyIcon AND NOT A NATIVE TOAST WITH BUTTONS
+    ------------------------------------------------------------
+    The first version of this used Windows.UI.Notifications directly, with an
+    "Install now" button using activationType="protocol" against a custom
+    thorium-zen5-update: scheme registered under HKCU\Software\Classes.
+
+    The toast displayed correctly. The button did not work. Clicking it
+    produced "Get an app to open this 'thorium-zen5-update' link".
+
+    That is NOT a registration problem, and it was worth proving rather than
+    guessing. With the handler temporarily repointed at a script that recorded
+    what it received, ShellExecute activation of the same URI ran the handler
+    fine -- so the scheme resolves, and the shell can open it. What cannot open
+    it is the toast activation broker, which requires the notifying app to have
+    an identity Windows only grants to packaged (MSIX) apps or to apps
+    registering a COM activator CLSID. A .ps1 run from Task Scheduler is
+    neither, and the usual workaround -- a Start Menu shortcut carrying a
+    System.AppUserModel.ID, set through IPropertyStore P/Invoke -- is a hundred
+    lines of COM interop to obtain an app identity we are only pretending to
+    have, which would then be one Windows update away from breaking again.
+
+    A NotifyIcon balloon avoids the broker entirely. Windows still surfaces it
+    as a notification and still files it in Action Center, but the click event
+    is delivered straight to the process that raised it, so the handler is a
+    PowerShell event subscription rather than a URI the OS has to route back to
+    an app it does not believe exists.
+
+    Cost of the approach, stated: this process has to stay alive while the
+    notification is on screen, and a tray icon is visible for that window.
+    TimeoutMinutes bounds it, and the scheduled task's own 10-minute execution
+    limit bounds it again.
     #>
-    $aumidKey = "HKCU:\Software\Classes\AppUserModelId\$AppId"
-    if (-not (Test-Path $aumidKey)) {
-        Say "Update available, but the toast notifier is not registered. Run scripts\Register-ThoriumUpdateNotifier.ps1 once, or install with: .\scripts\Check-ThoriumUpdate.ps1 -Install"
-        return
-    }
+    param($Available, $Installed, [int]$TimeoutMinutes = 5)
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
 
     $from = if ($Installed) { $Installed.Version } else { "not installed" }
-    $body = "Chromium $($Available.Version) is built and ready. Installed: $from."
 
-    Add-Type -AssemblyName System.Runtime.WindowsRuntime -ErrorAction SilentlyContinue
-    [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-    [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+    # Icon: the installed browser's own, when there is one. Falls back to the
+    # shell's information icon rather than failing over something cosmetic.
+    $icon = $null
+    if ($Installed -and $Installed.InstallPath) {
+        $exe = Get-ChildItem $Installed.InstallPath -Include "thorium.exe", "chrome.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($exe) { $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe.FullName) }
+    }
+    if (-not $icon) { $icon = [System.Drawing.SystemIcons]::Information }
 
-    $xml = @"
-<toast activationType="protocol" launch="thorium-zen5-update:show" scenario="reminder">
-  <visual>
-    <binding template="ToastGeneric">
-      <text>Thorium Zen5 update ready</text>
-      <text>$([System.Security.SecurityElement]::Escape($body))</text>
-    </binding>
-  </visual>
-  <actions>
-    <action content="Install now" activationType="protocol" arguments="thorium-zen5-update:install"/>
-    <action content="Later" activationType="system" arguments="dismiss"/>
-  </actions>
-</toast>
-"@
-    $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
-    $doc.LoadXml($xml)
-    $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
-    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId).Show($toast)
-    Say "Toast shown."
+    $ni = New-Object System.Windows.Forms.NotifyIcon
+    $ni.Icon = $icon
+    $ni.Text = "Thorium Zen5"
+    $ni.BalloonTipTitle = "Thorium Zen5 update ready"
+    $ni.BalloonTipText = "Chromium $($Available.Version) is built and ready (installed: $from). Click to install."
+    $ni.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+    $ni.Visible = $true
+
+    $script:NotifyClicked = $false
+    $script:NotifyDone = $false
+    # BalloonTipClicked fires on the notification; Click fires on the tray icon
+    # itself, which is the fallback if the balloon has already auto-dismissed
+    # into Action Center by the time the user looks at it.
+    $onClick  = Register-ObjectEvent -InputObject $ni -EventName BalloonTipClicked -Action { $script:NotifyClicked = $true; $script:NotifyDone = $true }
+    $onIcon   = Register-ObjectEvent -InputObject $ni -EventName Click            -Action { $script:NotifyClicked = $true; $script:NotifyDone = $true }
+    $onClosed = Register-ObjectEvent -InputObject $ni -EventName BalloonTipClosed -Action { $script:NotifyDone = $true }
+
+    try {
+        $ni.ShowBalloonTip(30000)
+        Say "Notification shown. Waiting up to $TimeoutMinutes min for a click."
+        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
+        while (-not $script:NotifyDone -and (Get-Date) -lt $deadline) {
+            [System.Windows.Forms.Application]::DoEvents()
+            Start-Sleep -Milliseconds 200
+        }
+        # A dismissed balloon is not a decline: it may have auto-hidden into
+        # Action Center while the user was elsewhere. Keep the tray icon
+        # clickable for the rest of the window in that case.
+        if ($script:NotifyDone -and -not $script:NotifyClicked) {
+            while (-not $script:NotifyClicked -and (Get-Date) -lt $deadline) {
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 200
+            }
+        }
+    } finally {
+        foreach ($s in @($onClick, $onIcon, $onClosed)) { if ($s) { Unregister-Event -SourceIdentifier $s.Name -ErrorAction SilentlyContinue } }
+        $ni.Visible = $false
+        $ni.Dispose()
+    }
+
+    return $script:NotifyClicked
 }
 
 # ---------------------------------------------------------------------------
@@ -283,19 +333,8 @@ function Install-Build($Available, $Installed) {
 
 # ---------------------------------------------------------------------------
 try {
-    # Toast activation arrives as a URI rather than a switch.
-    $uri = ($ProtocolArgs | Where-Object { $_ -like "thorium-zen5-update:*" } | Select-Object -First 1)
-    if ($uri -and $uri -match ':install$') { $Install = $true }
-
     $installed = Get-InstalledBuild
     $available = Get-AvailableBuild
-
-    if ($uri -and -not $Install) {
-        # Toast body clicked rather than the button: show where the build is
-        # instead of installing something nobody asked to install.
-        if ($available) { Start-Process explorer.exe $available.Dir }
-        exit 0
-    }
 
     if ($Install) {
         exit (Install-Build $available $installed)
@@ -313,7 +352,12 @@ try {
     }
 
     Say "Update available: $($available.Version) (installed: $(if ($installed) { $installed.Version } else { 'none' }))"
-    if (-not $Quiet) { Show-UpdateToast $available $installed }
+    if ($Quiet) { exit 10 }
+
+    if (Show-UpdateNotification -Available $available -Installed $installed -TimeoutMinutes $TimeoutMinutes) {
+        exit (Install-Build $available $installed)
+    }
+    Say "Not installed. The build stays in $($available.Dir); run with -Install whenever you want it."
     exit 10
 } catch {
     if (-not $Quiet) { Write-Error $_ }
