@@ -54,6 +54,31 @@ Log "=== update.ps1 starting (profile=$Profile, CheckOnly=$CheckOnly) ==="
 # "highest version" rather than "first entry" matters.
 . (Join-Path $RepoRoot "scripts\ChromiumVersion.ps1")
 
+# Toast + tray notification, shared with Check-ThoriumUpdate.ps1.
+. (Join-Path $RepoRoot "scripts\ThoriumNotify.ps1")
+
+# A FAILED BUILD USED TO TELL NOBODY ANYTHING.
+#
+# The success path notified; the failure path exited non-zero into a log that
+# only gets read by someone who already suspects something is wrong. The worst
+# case is the quietest one: a milestone bump breaks the zen5 patch anchors, the
+# pipeline stops at configure exactly as designed, and from the outside that is
+# indistinguishable from Chromium simply not having shipped a release. You
+# would notice weeks later, having silently stopped taking security updates.
+#
+# This trap covers anything that throws OUTSIDE a stage -- chromiumdash being
+# unreachable, a missing checkout, a bad tag. Stage failures are caught in
+# Invoke-Stage, which exits directly and so never reaches a trap.
+trap {
+    Log "Unhandled failure: $_" "ERROR"
+    try {
+        Show-ThoriumFailureNotice -Stage "update.ps1" -Detail "$_" -LogPath $LogFile -TimeoutMinutes 5 | Out-Null
+    } catch {
+        Log "Could not raise the failure notification: $_" "WARN"
+    }
+    exit 1
+}
+
 # 1. Is there a newer Chromium stable release than the one we last synced?
 #    build.ps1 sync pins the checkout to a Chromium stable tag and records it
 #    in build/chromium-tag.txt, so that file vs chromiumdash IS the update
@@ -136,6 +161,15 @@ function Invoke-Stage {
     } catch {
         $msg = if ($FailMessage) { $FailMessage } else { "$Name failed -- stopping pipeline (no release will be produced)." }
         Log "$msg Detail: $_" "ERROR"
+        # Say so on the desktop. Exiting non-zero into a log file is not
+        # telling anyone: this runs unattended at 03:00 and the only other
+        # signal a failure produces is the ABSENCE of an update notification,
+        # which looks exactly like a quiet week upstream.
+        try {
+            Show-ThoriumFailureNotice -Stage $Name -Detail "$msg $_" -LogPath $LogFile -TimeoutMinutes 5 | Out-Null
+        } catch {
+            Log "Could not raise the failure notification: $_" "WARN"
+        }
         exit $FailExit
     }
 }

@@ -77,7 +77,11 @@ $ErrorActionPreference = "Stop"
 $RepoRoot    = Split-Path -Parent $PSScriptRoot
 $ReleasesDir = Join-Path $RepoRoot "releases"
 $RegKey      = "HKCU:\Software\ThoriumZen5"
-$AppId       = "ThoriumZen5.UpdateNotifier"
+
+# Toast + tray notification, shared with update.ps1. Duplicating it across
+# both scripts is how this project once shipped the same version-resolution
+# bug twice over; see scripts/ChromiumVersion.ps1.
+. (Join-Path $PSScriptRoot "ThoriumNotify.ps1")
 
 function Say([string]$m) { if (-not $Quiet) { Write-Host $m } }
 
@@ -209,148 +213,6 @@ function Test-IsNewer($Available, $Installed) {
 }
 
 # ---------------------------------------------------------------------------
-# Notification
-# ---------------------------------------------------------------------------
-function Register-NotifierAppId {
-    <#
-    An AppUserModelID registered under HKCU, claimed by this process.
-
-    Windows needs an app identity to render a notification properly. Without
-    one, Windows 11 shows the balloon as a toast with an icon and NO TITLE AND
-    NO BODY -- which is exactly what happened here on 2026-09-16: the
-    notification appeared, said nothing, and was useless.
-
-    Idempotent, HKCU only, three values. No separate setup step to forget.
-    #>
-    $key = "HKCU:\Software\Classes\AppUserModelId\$AppId"
-    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-    New-ItemProperty -Path $key -Name "DisplayName"    -Value "Thorium Zen5" -PropertyType String -Force | Out-Null
-    New-ItemProperty -Path $key -Name "ShowInSettings" -Value 1             -PropertyType DWord  -Force | Out-Null
-
-    $exe = Get-BrowserExe
-    if ($exe) { New-ItemProperty -Path $key -Name "IconUri" -Value $exe -PropertyType String -Force | Out-Null }
-
-    # Claim it for THIS process, or the notification is attributed to
-    # "Windows PowerShell" and inherits its (empty) presentation.
-    if (-not ("W.Shell" -as [type])) {
-        Add-Type -Namespace W -Name Shell -MemberDefinition @"
-[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, PreserveSig=false)]
-public static extern void SetCurrentProcessExplicitAppUserModelID(string AppID);
-"@
-    }
-    try { [W.Shell]::SetCurrentProcessExplicitAppUserModelID($AppId) } catch { }
-}
-
-function Get-BrowserExe {
-    $installPath = (Get-ItemProperty $RegKey -ErrorAction SilentlyContinue).InstallPath
-    if (-not $installPath) { return $null }
-    $exe = Get-ChildItem $installPath -Include "thorium.exe", "chrome.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($exe) { return $exe.FullName }
-    return $null
-}
-
-function Show-UpdateNotification {
-    <#
-    Returns $true if the user asked to install.
-
-    TWO SURFACES, AND WHY
-    ---------------------
-    Neither mechanism Windows offers an unpackaged script does both halves of
-    this job, so each is used for the half it actually does.
-
-    DISPLAY is a native toast (Windows.UI.Notifications). Verified rendering
-    correctly on this machine: title, body, the lot.
-
-    THE ACTION is a tray icon. Toast buttons cannot be made to work here:
-    activationType="protocol" is refused by the toast broker, which grants
-    activation only to packaged (MSIX) apps or ones registering a COM
-    activator. Proven, not assumed -- ShellExecute activation of the very same
-    URI ran the handler fine, so the scheme resolved and only the broker
-    refused it.
-
-    A NotifyIcon balloon was tried as the single mechanism for both and is not
-    usable on its own: its click works, but Windows 11 renders it with no title
-    and no body.
-
-    So: the toast says what is ready and points at the tray icon; the tray icon
-    is the button. The toast carries no buttons, because a button that does
-    nothing is worse than no button.
-
-    Cost, stated: this process stays alive while the tray icon is up, bounded
-    by -TimeoutMinutes and again by the scheduled task's execution limit.
-    #>
-    param($Available, $Installed, [int]$TimeoutMinutes = 5)
-
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
-
-    Register-NotifierAppId
-
-    $from = if ($Installed) { $Installed.Version } else { "nothing installed yet" }
-    $body = "Chromium $($Available.Version) is built and ready. Installed: $from. Click the Thorium Zen5 icon in the system tray to install it."
-
-    # --- display: native toast
-    try {
-        [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
-        [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
-        $xml = @"
-<toast>
-  <visual>
-    <binding template="ToastGeneric">
-      <text>Thorium Zen5 update ready</text>
-      <text>$([System.Security.SecurityElement]::Escape($body))</text>
-    </binding>
-  </visual>
-</toast>
-"@
-        # Clear our own earlier notifications first. Without this the
-        # notification centre accumulates one entry per check, and -- worse,
-        # during this project's own history -- kept showing toasts from an
-        # older revision whose "Install now" button could never work, long
-        # after that button had been removed from the code. A stale
-        # notification offering a dead button is indistinguishable, to the
-        # person looking at it, from a live one that is broken.
-        try { [Windows.UI.Notifications.ToastNotificationManager]::History.Clear($AppId) } catch { }
-
-        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
-        $doc.LoadXml($xml)
-        $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
-        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId).Show($toast)
-        Say "Notification shown (also filed in the notification centre, Win+N)."
-    } catch {
-        # Never let a cosmetic failure cost the user the update itself.
-        Say "Could not raise the toast ($($_.Exception.Message)). The tray icon is still there."
-    }
-
-    # --- action: tray icon
-    $exe = Get-BrowserExe
-    $icon = if ($exe) { [System.Drawing.Icon]::ExtractAssociatedIcon($exe) } else { [System.Drawing.SystemIcons]::Information }
-
-    $ni = New-Object System.Windows.Forms.NotifyIcon
-    $ni.Icon = $icon
-    $ni.Text = "Install Thorium Zen5 $($Available.Version)"   # tooltip: says what clicking does
-    $ni.Visible = $true
-
-    $script:NotifyClicked = $false
-    $onIcon = Register-ObjectEvent -InputObject $ni -EventName Click -Action { $script:NotifyClicked = $true }
-
-    try {
-        Say "Tray icon active for up to $TimeoutMinutes min. Click it to install."
-        $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-        while (-not $script:NotifyClicked -and (Get-Date) -lt $deadline) {
-            [System.Windows.Forms.Application]::DoEvents()
-            Start-Sleep -Milliseconds 200
-        }
-    } finally {
-        if ($onIcon) { Unregister-Event -SourceIdentifier $onIcon.Name -ErrorAction SilentlyContinue }
-        $ni.Visible = $false
-        $ni.Dispose()
-    }
-
-    return $script:NotifyClicked
-}
-
-# ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
 function Install-Build($Available, $Installed) {
@@ -411,7 +273,11 @@ try {
     Say "Update available: $($available.Version) (installed: $(if ($installed) { $installed.Version } else { 'none' }))"
     if ($Quiet) { exit 10 }
 
-    if (Show-UpdateNotification -Available $available -Installed $installed -TimeoutMinutes $TimeoutMinutes) {
+    $from  = if ($installed) { $installed.Version } else { "nothing installed yet" }
+    $title = "Thorium Zen5 update ready"
+    $body  = "Chromium $($available.Version) is built and ready. Installed: $from. Click the Thorium Zen5 icon in the system tray to install it."
+    if (Show-ThoriumNotification -Title $title -Body $body -TimeoutMinutes $TimeoutMinutes `
+            -TrayTooltip "Install Thorium Zen5 $($available.Version)") {
         exit (Install-Build $available $installed)
     }
     Say "Not installed. The build stays in $($available.Dir); run with -Install whenever you want it."
