@@ -294,7 +294,7 @@ function Show-UpdateNotification {
         [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
         [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
         $xml = @"
-<toast scenario="reminder">
+<toast>
   <visual>
     <binding template="ToastGeneric">
       <text>Thorium Zen5 update ready</text>
@@ -307,7 +307,7 @@ function Show-UpdateNotification {
         $doc.LoadXml($xml)
         $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId).Show($toast)
-        Say "Notification shown."
+        Say "Notification shown (also filed in the notification centre, Win+N)."
     } catch {
         # Never let a cosmetic failure cost the user the update itself.
         Say "Could not raise the toast ($($_.Exception.Message)). The tray icon is still there."
