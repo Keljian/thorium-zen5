@@ -58,6 +58,15 @@ param(
     [switch]$Install,
     [switch]$Quiet,
 
+    # Raise the notification even when the installed build is already current.
+    #
+    # Without this there is no way to exercise the notification path on demand:
+    # it only fires when a newer build exists, so the only way to see it was to
+    # wait for Chromium to ship a release. Clicking through with -Force
+    # reinstalls the same version, which Inno handles as an in-place upgrade,
+    # so this tests the real path rather than a mock of it.
+    [switch]$Force,
+
     # How long to leave the notification up waiting for a click. The scheduled
     # task that runs this has its own 10-minute execution limit, so keep this
     # comfortably under it.
@@ -345,12 +354,15 @@ try {
         exit 0
     }
 
-    if (-not (Test-IsNewer $available $installed)) {
+    if (-not (Test-IsNewer $available $installed) -and -not $Force) {
         $what = if ($installed) { "Installed $($installed.Version) is current." } else { "Nothing installed, and nothing newer available." }
         Say $what
         exit 0
     }
 
+    if ($Force -and -not (Test-IsNewer $available $installed)) {
+        Say "-Force: installed build is already current; raising the notification anyway to test it."
+    }
     Say "Update available: $($available.Version) (installed: $(if ($installed) { $installed.Version } else { 'none' }))"
     if ($Quiet) { exit 10 }
 

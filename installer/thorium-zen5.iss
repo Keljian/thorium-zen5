@@ -122,32 +122,39 @@ Filename: "{app}\{#MainExeName}"; Description: "Launch Thorium Zen5"; Flags: now
 ; that explicit opt-in prompt).
 
 [Code]
-// IMPORTANT / KNOWN LIMITATION (documented in installer/README.md and
-// docs/ARCHITECTURE.md "unresolved questions"): Thorium's product-identity
-// constants (install_static / chrome_paths.cc) are baked into the compiled
-// binary and hardcode the profile directory name as "Thorium" regardless of
-// where the .exe is actually installed from. None of the current
-// patches/zen5 edits touch this. That means Thorium Zen5, as built by this
-// project today, stores its user profile at the SAME path stock Thorium
-// would: %LOCALAPPDATA%\Thorium\User Data -- NOT under this installer's own
-// %LOCALAPPDATA%\ThoriumZen5\ install directory. On a single-machine
-// personal build (this project's stated scope) that's harmless and even
-// convenient (an in-place "upgrade" from any previous stock Thorium install
-// carries your profile forward automatically); it only matters if you ever
-// intend to run stock Thorium and Thorium Zen5 side by side, in which case
-// they would currently share one profile. A future patches/zen5 addition
-// could rebrand the product-identity constants for full isolation; tracked
-// as an unresolved item rather than silently assumed away.
+// WHERE THE PROFILE ACTUALLY LIVES
+//
+// Chromium's product-identity constants (install_static / chrome_paths.cc)
+// are baked into the binary and decide the profile directory name; nothing in
+// patches/zen5 touches them. This project builds STOCK Chromium, so the
+// profile is at %LOCALAPPDATA%\Chromium\User Data -- NOT under this
+// installer's own install directory, and NOT under a "Thorium" name.
+//
+// Verified on rohansdesktopry 2026-09-16: launching the installed browser
+// with no --user-data-dir created no new directory under %LOCALAPPDATA% and
+// used the existing Chromium\ one. %LOCALAPPDATA%\Thorium does not exist on
+// this machine at all.
+//
+// An earlier revision of this script said "Thorium\User Data", left over
+// from when this project overlaid Thorium's sources. That was wrong in a way
+// that mattered: the uninstaller offered to delete a directory that is not
+// this browser's profile, and would have deleted a real stock-Thorium profile
+// had one existed.
+//
+// CONSEQUENCE worth knowing: this installed build and the copy you run out of
+// src\out\thorium-<profile>\ share ONE profile, because they are the same
+// product identity. Deleting profile data here affects both.
 var
   RemoveProfileData: Boolean;
 
 function InitializeUninstall(): Boolean;
 begin
   RemoveProfileData := False;
-  if MsgBox('Also delete your Thorium Zen5 profile data (bookmarks, history, ' +
+  if MsgBox('Also delete your browser profile data (bookmarks, history, ' +
             'saved passwords, extensions)? Choose No to keep it for a future reinstall.' + #13#10 + #13#10 +
-            'Note: profile data currently lives at %LOCALAPPDATA%\Thorium\User Data ' +
-            '(see installer/README.md) -- the same location stock Thorium would use.',
+            'This profile lives at %LOCALAPPDATA%\Chromium\User Data and is SHARED ' +
+            'with any copy of this build you run from src\out\. Deleting it affects ' +
+            'both.',
             mbConfirmation, MB_YESNO) = IDYES then
     RemoveProfileData := True;
   Result := True;
@@ -159,7 +166,7 @@ var
 begin
   if (CurUninstallStep = usPostUninstall) and RemoveProfileData then
   begin
-    ProfileDir := ExpandConstant('{localappdata}\Thorium\User Data');
+    ProfileDir := ExpandConstant('{localappdata}\Chromium\User Data');
     if DirExists(ProfileDir) then
       DelTree(ProfileDir, True, True, True);
   end;
