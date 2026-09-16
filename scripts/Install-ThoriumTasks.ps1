@@ -135,8 +135,18 @@ if ($RunWhenLoggedOff) {
 # ---------------------------------------------------------------------------
 # Task 2: offer
 # ---------------------------------------------------------------------------
-$offerAction = New-ScheduledTaskAction -Execute $PwshExe -WorkingDirectory $RepoRoot `
-    -Argument ('-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File "{0}" -Profile {1}' -f $CheckPs1, $Profile)
+# Launched through wscript.exe, NOT powershell.exe directly.
+#
+# powershell.exe -WindowStyle Hidden is not enough on Windows 11: Windows
+# Terminal is the default console host and creates its own window before
+# PowerShell ever honours -WindowStyle. The checker therefore flashed a visible
+# terminal on every run -- six times a day, showing its own console output.
+# Observed on rohansdesktopry 2026-09-16.
+#
+# run-hidden.vbs uses WScript.Shell.Run with intWindowStyle 0, which suppresses
+# the window at creation time, the one thing Terminal cannot override.
+$offerAction = New-ScheduledTaskAction -Execute "wscript.exe" -WorkingDirectory $RepoRoot `
+    -Argument ('"{0}" "{1}" "-Profile" "{2}"' -f (Join-Path $PSScriptRoot "run-hidden.vbs"), $CheckPs1, $Profile)
 
 # Logon, plus a daily trigger that repeats every 4 hours for 24 hours.
 #
