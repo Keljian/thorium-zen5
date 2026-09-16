@@ -95,7 +95,11 @@ Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "Profi
 Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}";                  Flags: uninsdeletekey
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"; Flags: unchecked
+; NOT "Flags: unchecked". A silent install skips unchecked tasks entirely, so
+; with that flag a /VERYSILENT install -- which is exactly how the update path
+; installs -- produced no desktop shortcut and no obvious way to launch the
+; browser. Observed on rohansdesktopry 2026-09-16.
+Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
 
 [Files]
 ; Recursively install every extracted application file. "app" files are
@@ -106,9 +110,14 @@ Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription
 Source: "{#AppFilesDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion
 
 [Icons]
-Name: "{group}\Thorium Zen5"; Filename: "{app}\{#MainExeName}"; Comment: "Thorium Zen5 -- Zen 5/AVX-512 optimized browser [{#ProfileName}]"
-Name: "{group}\Uninstall Thorium Zen5"; Filename: "{uninstallexe}"
+; Top level in Start Menu, not tucked inside a "Thorium Zen5" group folder:
+; a group containing one browser and one uninstaller is a folder you have to
+; open before you can find the thing you wanted.
+Name: "{userprograms}\Thorium Zen5"; Filename: "{app}\{#MainExeName}"; Comment: "Thorium Zen5 -- Zen 5/AVX-512 optimized browser [{#ProfileName}]"
 Name: "{userdesktop}\Thorium Zen5"; Filename: "{app}\{#MainExeName}"; Tasks: desktopicon
+; The uninstaller stays in a group: it is not something to reach for often, and
+; Add/Remove Programs is the usual route to it anyway.
+Name: "{group}\Uninstall Thorium Zen5"; Filename: "{uninstallexe}"
 
 [Run]
 Filename: "{app}\{#MainExeName}"; Description: "Launch Thorium Zen5"; Flags: nowait postinstall skipifsilent

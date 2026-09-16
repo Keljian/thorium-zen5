@@ -77,6 +77,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot    = Split-Path -Parent $PSScriptRoot
 $ReleasesDir = Join-Path $RepoRoot "releases"
 $RegKey      = "HKCU:\Software\ThoriumZen5"
+$AppId       = "ThoriumZen5.UpdateNotifier"
 
 function Say([string]$m) { if (-not $Quiet) { Write-Host $m } }
 
@@ -210,94 +211,129 @@ function Test-IsNewer($Available, $Installed) {
 # ---------------------------------------------------------------------------
 # Notification
 # ---------------------------------------------------------------------------
+function Register-NotifierAppId {
+    <#
+    An AppUserModelID registered under HKCU, claimed by this process.
+
+    Windows needs an app identity to render a notification properly. Without
+    one, Windows 11 shows the balloon as a toast with an icon and NO TITLE AND
+    NO BODY -- which is exactly what happened here on 2026-09-16: the
+    notification appeared, said nothing, and was useless.
+
+    Idempotent, HKCU only, three values. No separate setup step to forget.
+    #>
+    $key = "HKCU:\Software\Classes\AppUserModelId\$AppId"
+    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+    New-ItemProperty -Path $key -Name "DisplayName"    -Value "Thorium Zen5" -PropertyType String -Force | Out-Null
+    New-ItemProperty -Path $key -Name "ShowInSettings" -Value 1             -PropertyType DWord  -Force | Out-Null
+
+    $exe = Get-BrowserExe
+    if ($exe) { New-ItemProperty -Path $key -Name "IconUri" -Value $exe -PropertyType String -Force | Out-Null }
+
+    # Claim it for THIS process, or the notification is attributed to
+    # "Windows PowerShell" and inherits its (empty) presentation.
+    if (-not ("W.Shell" -as [type])) {
+        Add-Type -Namespace W -Name Shell -MemberDefinition @"
+[System.Runtime.InteropServices.DllImport("shell32.dll", CharSet=System.Runtime.InteropServices.CharSet.Unicode, PreserveSig=false)]
+public static extern void SetCurrentProcessExplicitAppUserModelID(string AppID);
+"@
+    }
+    try { [W.Shell]::SetCurrentProcessExplicitAppUserModelID($AppId) } catch { }
+}
+
+function Get-BrowserExe {
+    $installPath = (Get-ItemProperty $RegKey -ErrorAction SilentlyContinue).InstallPath
+    if (-not $installPath) { return $null }
+    $exe = Get-ChildItem $installPath -Include "thorium.exe", "chrome.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($exe) { return $exe.FullName }
+    return $null
+}
+
 function Show-UpdateNotification {
     <#
     Returns $true if the user asked to install.
 
-    WHY THIS IS A NotifyIcon AND NOT A NATIVE TOAST WITH BUTTONS
-    ------------------------------------------------------------
-    The first version of this used Windows.UI.Notifications directly, with an
-    "Install now" button using activationType="protocol" against a custom
-    thorium-zen5-update: scheme registered under HKCU\Software\Classes.
+    TWO SURFACES, AND WHY
+    ---------------------
+    Neither mechanism Windows offers an unpackaged script does both halves of
+    this job, so each is used for the half it actually does.
 
-    The toast displayed correctly. The button did not work. Clicking it
-    produced "Get an app to open this 'thorium-zen5-update' link".
+    DISPLAY is a native toast (Windows.UI.Notifications). Verified rendering
+    correctly on this machine: title, body, the lot.
 
-    That is NOT a registration problem, and it was worth proving rather than
-    guessing. With the handler temporarily repointed at a script that recorded
-    what it received, ShellExecute activation of the same URI ran the handler
-    fine -- so the scheme resolves, and the shell can open it. What cannot open
-    it is the toast activation broker, which requires the notifying app to have
-    an identity Windows only grants to packaged (MSIX) apps or to apps
-    registering a COM activator CLSID. A .ps1 run from Task Scheduler is
-    neither, and the usual workaround -- a Start Menu shortcut carrying a
-    System.AppUserModel.ID, set through IPropertyStore P/Invoke -- is a hundred
-    lines of COM interop to obtain an app identity we are only pretending to
-    have, which would then be one Windows update away from breaking again.
+    THE ACTION is a tray icon. Toast buttons cannot be made to work here:
+    activationType="protocol" is refused by the toast broker, which grants
+    activation only to packaged (MSIX) apps or ones registering a COM
+    activator. Proven, not assumed -- ShellExecute activation of the very same
+    URI ran the handler fine, so the scheme resolved and only the broker
+    refused it.
 
-    A NotifyIcon balloon avoids the broker entirely. Windows still surfaces it
-    as a notification and still files it in Action Center, but the click event
-    is delivered straight to the process that raised it, so the handler is a
-    PowerShell event subscription rather than a URI the OS has to route back to
-    an app it does not believe exists.
+    A NotifyIcon balloon was tried as the single mechanism for both and is not
+    usable on its own: its click works, but Windows 11 renders it with no title
+    and no body.
 
-    Cost of the approach, stated: this process has to stay alive while the
-    notification is on screen, and a tray icon is visible for that window.
-    TimeoutMinutes bounds it, and the scheduled task's own 10-minute execution
-    limit bounds it again.
+    So: the toast says what is ready and points at the tray icon; the tray icon
+    is the button. The toast carries no buttons, because a button that does
+    nothing is worse than no button.
+
+    Cost, stated: this process stays alive while the tray icon is up, bounded
+    by -TimeoutMinutes and again by the scheduled task's execution limit.
     #>
     param($Available, $Installed, [int]$TimeoutMinutes = 5)
 
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
 
-    $from = if ($Installed) { $Installed.Version } else { "not installed" }
+    Register-NotifierAppId
 
-    # Icon: the installed browser's own, when there is one. Falls back to the
-    # shell's information icon rather than failing over something cosmetic.
-    $icon = $null
-    if ($Installed -and $Installed.InstallPath) {
-        $exe = Get-ChildItem $Installed.InstallPath -Include "thorium.exe", "chrome.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($exe) { $icon = [System.Drawing.Icon]::ExtractAssociatedIcon($exe.FullName) }
+    $from = if ($Installed) { $Installed.Version } else { "nothing installed yet" }
+    $body = "Chromium $($Available.Version) is built and ready. Installed: $from. Click the Thorium Zen5 icon in the system tray to install it."
+
+    # --- display: native toast
+    try {
+        [void][Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]
+        [void][Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime]
+        $xml = @"
+<toast scenario="reminder">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>Thorium Zen5 update ready</text>
+      <text>$([System.Security.SecurityElement]::Escape($body))</text>
+    </binding>
+  </visual>
+</toast>
+"@
+        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $doc.LoadXml($xml)
+        $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
+        [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($AppId).Show($toast)
+        Say "Notification shown."
+    } catch {
+        # Never let a cosmetic failure cost the user the update itself.
+        Say "Could not raise the toast ($($_.Exception.Message)). The tray icon is still there."
     }
-    if (-not $icon) { $icon = [System.Drawing.SystemIcons]::Information }
+
+    # --- action: tray icon
+    $exe = Get-BrowserExe
+    $icon = if ($exe) { [System.Drawing.Icon]::ExtractAssociatedIcon($exe) } else { [System.Drawing.SystemIcons]::Information }
 
     $ni = New-Object System.Windows.Forms.NotifyIcon
     $ni.Icon = $icon
-    $ni.Text = "Thorium Zen5"
-    $ni.BalloonTipTitle = "Thorium Zen5 update ready"
-    $ni.BalloonTipText = "Chromium $($Available.Version) is built and ready (installed: $from). Click to install."
-    $ni.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+    $ni.Text = "Install Thorium Zen5 $($Available.Version)"   # tooltip: says what clicking does
     $ni.Visible = $true
 
     $script:NotifyClicked = $false
-    $script:NotifyDone = $false
-    # BalloonTipClicked fires on the notification; Click fires on the tray icon
-    # itself, which is the fallback if the balloon has already auto-dismissed
-    # into Action Center by the time the user looks at it.
-    $onClick  = Register-ObjectEvent -InputObject $ni -EventName BalloonTipClicked -Action { $script:NotifyClicked = $true; $script:NotifyDone = $true }
-    $onIcon   = Register-ObjectEvent -InputObject $ni -EventName Click            -Action { $script:NotifyClicked = $true; $script:NotifyDone = $true }
-    $onClosed = Register-ObjectEvent -InputObject $ni -EventName BalloonTipClosed -Action { $script:NotifyDone = $true }
+    $onIcon = Register-ObjectEvent -InputObject $ni -EventName Click -Action { $script:NotifyClicked = $true }
 
     try {
-        $ni.ShowBalloonTip(30000)
-        Say "Notification shown. Waiting up to $TimeoutMinutes min for a click."
+        Say "Tray icon active for up to $TimeoutMinutes min. Click it to install."
         $deadline = (Get-Date).AddMinutes($TimeoutMinutes)
-        while (-not $script:NotifyDone -and (Get-Date) -lt $deadline) {
+        while (-not $script:NotifyClicked -and (Get-Date) -lt $deadline) {
             [System.Windows.Forms.Application]::DoEvents()
             Start-Sleep -Milliseconds 200
         }
-        # A dismissed balloon is not a decline: it may have auto-hidden into
-        # Action Center while the user was elsewhere. Keep the tray icon
-        # clickable for the rest of the window in that case.
-        if ($script:NotifyDone -and -not $script:NotifyClicked) {
-            while (-not $script:NotifyClicked -and (Get-Date) -lt $deadline) {
-                [System.Windows.Forms.Application]::DoEvents()
-                Start-Sleep -Milliseconds 200
-            }
-        }
     } finally {
-        foreach ($s in @($onClick, $onIcon, $onClosed)) { if ($s) { Unregister-Event -SourceIdentifier $s.Name -ErrorAction SilentlyContinue } }
+        if ($onIcon) { Unregister-Event -SourceIdentifier $onIcon.Name -ErrorAction SilentlyContinue }
         $ni.Visible = $false
         $ni.Dispose()
     }
