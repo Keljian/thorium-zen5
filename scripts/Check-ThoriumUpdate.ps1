@@ -303,6 +303,15 @@ function Show-UpdateNotification {
   </visual>
 </toast>
 "@
+        # Clear our own earlier notifications first. Without this the
+        # notification centre accumulates one entry per check, and -- worse,
+        # during this project's own history -- kept showing toasts from an
+        # older revision whose "Install now" button could never work, long
+        # after that button had been removed from the code. A stale
+        # notification offering a dead button is indistinguishable, to the
+        # person looking at it, from a live one that is broken.
+        try { [Windows.UI.Notifications.ToastNotificationManager]::History.Clear($AppId) } catch { }
+
         $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
         $doc.LoadXml($xml)
         $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
