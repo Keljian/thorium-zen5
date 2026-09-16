@@ -94,13 +94,6 @@ Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "Build
 Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "Profile";     ValueData: "{#ProfileName}";         Flags: uninsdeletevalue
 Root: HKCU; Subkey: "Software\ThoriumZen5"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}";                  Flags: uninsdeletekey
 
-[Tasks]
-; NOT "Flags: unchecked". A silent install skips unchecked tasks entirely, so
-; with that flag a /VERYSILENT install -- which is exactly how the update path
-; installs -- produced no desktop shortcut and no obvious way to launch the
-; browser. Observed on rohansdesktopry 2026-09-16.
-Name: "desktopicon"; Description: "Create a &desktop shortcut"; GroupDescription: "Additional shortcuts:"
-
 [Files]
 ; Recursively install every extracted application file. "app" files are
 ; replaced wholesale on upgrade. This [Files] section never touches the
@@ -114,7 +107,19 @@ Source: "{#AppFilesDir}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsub
 ; a group containing one browser and one uninstaller is a folder you have to
 ; open before you can find the thing you wanted.
 Name: "{userprograms}\Thorium Zen5"; Filename: "{app}\{#MainExeName}"; Comment: "Thorium Zen5 -- Zen 5/AVX-512 optimized browser [{#ProfileName}]"
-Name: "{userdesktop}\Thorium Zen5"; Filename: "{app}\{#MainExeName}"; Tasks: desktopicon
+; NO "Tasks:" CONDITION. The desktop shortcut was a task, and that failed twice
+; over for a browser installed silently:
+;   1. with "Flags: unchecked" a silent install skips the task outright;
+;   2. removing that flag was still not enough, because Inno remembers the
+;      previous run's task selection in "Inno Setup: Selected Tasks" under the
+;      uninstall key, and a silent REINSTALL reuses the remembered selection
+;      rather than the new default. That value was empty from the first
+;      install, so the icon stayed missing. Observed on rohansdesktopry
+;      2026-09-16.
+; Unconditional is the right shape here anyway: this is a personal
+; single-machine build, and the whole point of the update path is that it
+; installs without anyone answering a wizard.
+Name: "{userdesktop}\Thorium Zen5"; Filename: "{app}\{#MainExeName}"; Comment: "Thorium Zen5 -- Zen 5/AVX-512 optimized browser [{#ProfileName}]"
 ; The uninstaller stays in a group: it is not something to reach for often, and
 ; Add/Remove Programs is the usual route to it anyway.
 Name: "{group}\Uninstall Thorium Zen5"; Filename: "{uninstallexe}"
