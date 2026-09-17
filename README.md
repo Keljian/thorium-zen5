@@ -99,6 +99,27 @@ GFNI, VAES, VPCLMULQDQ) are all present, and none of them exist on
 skylake-avx512, so the build really is targeting Zen 5 and not just
 "some AVX-512".
 
+### Binary size, which is what the workaround costs
+
+Shipped artifacts from `out\thorium-zen5`:
+
+| artifact | bytes | |
+|---|---|---|
+| `chrome.dll` | 308,667,904 | 294.4 MiB |
+| `chrome.exe` | 4,424,704 | 4.2 MiB (launcher stub) |
+| `mini_installer.exe` | 128,859,648 | 122.9 MiB |
+| `setup.exe` | 6,247,936 | 6.0 MiB |
+
+Against the `baseline` profile's `chrome.dll` (301,824,512 bytes), zen5 is
+**+6,843,392 bytes, +2.27%**.
+
+That delta is *not* attributable to the tail-merge workaround alone -- the
+two profiles also differ by `-march`/`-mtune=znver5`,
+`-mllvm:-import-instr-limit=100` and `/opt:lldlto=3`, and the first and third
+of those inflate code size on their own. Disabling tail merging gives up a
+code-size optimization, so it is a contributor, but isolating its share would
+need a build that varies only that flag. Not measured, so not claimed.
+
 ### Performance, honestly
 
 **Speedometer 3.1, baseline vs zen5: +1.32% (n=30, p=0.52). Not
