@@ -56,24 +56,101 @@ comparison point.
 
 ## Status
 
-Built, measured and packaged against Chromium 154.0.8037.17:
+Built, verified, measured, packaged and installed against Chromium
+154.0.8037.17.
 
-- `build/isa-report-zen5.txt` -- 69,660,888 instructions disassembled in
-  chrome.dll, 331,405 of them using ZMM registers, 679,382 AVX-512-family
-  total. The Zen-specific extensions (VNNI, VBMI, VBMI2, VPOPCNTDQ, IFMA,
-  BITALG, GFNI, VAES, VPCLMULQDQ) are all present, and none of them exist
-  on skylake-avx512, so the build really targets Zen 5.
-- `build/build-manifest-zen5.json` -- the exact GN args, clang revision
-  and Chromium commit the shipped binary came from.
-- `releases/` -- packaged build plus its reports.
+### The targeting is verified, not assumed
 
-Open items, stated rather than skipped:
+`verify-source.ps1 -Profile zen5` asserts that the targeting actually reached
+the generated build files, rather than trusting `args.gn`. All five checks
+pass:
 
-- **No `baseline` build exists**, so the performance value of the Zen 5
-  targeting is unmeasured. 331,405 ZMM instructions is about 0.5% of the
-  binary. `docs/BENCHMARKS.md` is still empty.
-- Three toolchain workarounds are in force (tail-merge off, SLP capped at
-  256 bits, and the `-mllvm:-march=` backend flag, which is measured to be
-  a no-op). See `docs/TOOLCHAIN-BUGS.md` and `patches/zen5/README.md`.
-- PGO uses Google's official generic win64 profile, not a Zen5-trained
-  one. See `docs/BUILD.md` "About PGO".
+| check | asserts |
+|---|---|
+| `cxx_march` / `cxx_mtune` | `-march=znver5 -mtune=znver5` on the C++ compile |
+| `rust_cpu` | `-Ctarget-cpu=znver5` on the Rust compile |
+| `tail_merge_workaround` | `-mllvm:-enable-tail-merge=false` on the chrome.dll link |
+| `slp_cap_workaround` | `-mllvm:-slp-max-reg-size=256` on the chrome.dll link |
+
+This section exists because every real failure on this project has been the
+same shape: a flag that was declared but never applied, and therefore
+invisible in a green build.
+
+### Codegen, measured
+
+From `build/isa-report-zen5.txt`, disassembling the shipped `chrome.dll`:
+
+| | before Rust targeting | shipped | delta |
+|---|---|---|---|
+| total instructions | 69,660,888 | 69,523,617 | -137,271 (-0.20%) |
+| ZMM (512-bit) | 331,405 | 361,105 | **+29,700 (+9.0%)** |
+| YMM (256-bit) | 399,555 | 402,411 | +2,856 (+0.7%) |
+| AVX-512 family | 679,382 | 714,183 | **+34,801 (+5.1%)** |
+
+The delta column is the effect of exactly one change: `-Ctarget-cpu=znver5`
+finally reaching rustc. GN `cflags` never reach rustc, so for this project's
+entire history before that fix, 278 Rust rlibs -- font shaping and image
+decode among them -- were compiled at the generic x86-64 baseline while
+`args.gn` looked perfect. It bought 9% more 512-bit code in a *smaller*
+binary.
+
+The Zen-specific extensions (VNNI, VBMI, VBMI2, VPOPCNTDQ, IFMA, BITALG,
+GFNI, VAES, VPCLMULQDQ) are all present, and none of them exist on
+skylake-avx512, so the build really is targeting Zen 5 and not just
+"some AVX-512".
+
+### Performance, honestly
+
+**Speedometer 3.1, baseline vs zen5: +1.32% (n=30, p=0.52). Not
+significant.** This is the only controlled comparison that exists, and it
+carries its own caveat: how the two browsers were launched was not recorded,
+so the process singleton may have fed both runs to the same binary. See
+`docs/BENCHMARKS.md`.
+
+**MotionMark: 2935.64 (+/-2.01%) zen5 vs 1305.84 (+/-31.57%) baseline.
+Recorded, not believed.** A 2.2x on a graphics benchmark is not a plausible
+consequence of instruction selection, and the baseline run's +/-31.57%
+variance says that run was unstable rather than slow. Treat it as an
+unvalidated observation until it is re-run under
+`scripts\Start-BenchBrowser.ps1`.
+
+So: the codegen change is real and verified; a user-visible speedup is not
+established. Those are two different claims and this file keeps them apart.
+
+### Installed
+
+A silent, user-level install of the shipped build sits at
+`%LOCALAPPDATA%\Chromium\Application\154.0.8037.17`, registered as "Chromium"
+in Add/Remove Programs. Its `chrome.dll` hashes identical to
+`out\thorium-zen5\chrome.dll`. The existing profile under
+`%LOCALAPPDATA%\Chromium\User Data` is adopted in place and was not modified.
+
+Reinstall after any rebuild with:
+
+```
+out\thorium-zen5\mini_installer.exe --do-not-launch-chrome --verbose-logging
+```
+
+Note that on Windows `chrome.exe --version` does not print and exit -- it
+ignores the flag and launches the browser. Read the version from the file's
+version resource instead.
+
+### Open items, stated rather than skipped
+
+- **Two** toolchain workarounds are in force (tail-merge off, SLP capped at
+  256 bits). The third, the `-mllvm:-march=` backend flag, was measured to be
+  a no-op and is now off (`zen5_lto_backend_march = false`). See
+  `docs/TOOLCHAIN-BUGS.md` and `patches/zen5/README.md`.
+- The shipped binary carries two LTO knobs that are **unmeasured**:
+  `-mllvm:-import-instr-limit=100` and `/opt:lldlto=3`. Plausible wins, not
+  established ones.
+- PGO uses Google's official generic win64 profile, not a Zen5-trained one.
+  See `docs/BUILD.md` "About PGO".
+- No Google API keys are baked in, by choice, so Sync and the Safe Browsing
+  lookup service are inactive.
+- `scripts/attribute_isa.py` (per-component, per-operation vector
+  attribution) is committed but has never been run.
+- `verify-source.ps1` now skips `git fsck` on the Chromium checkout by
+  default; it cost 30-60+ minutes of solid CPU and starved the checks that
+  actually catch regressions. Pass `-DeepFsck` when you specifically suspect
+  checkout corruption.
