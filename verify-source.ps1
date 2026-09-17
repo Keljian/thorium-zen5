@@ -180,6 +180,66 @@ if (Test-Path $argsGnPath) {
     Add-Warn "$argsGnPath not found -- profile not configured yet (run build.ps1 configure -Profile $Profile)."
 }
 
+# 5b. The targeting actually REACHED the generated build files.
+#
+#     args.gn saying use_znver5 = true proves only that the argument was set.
+#     Every real failure on this project has been of the other kind: a flag
+#     that was declared but never applied, and therefore invisible in a green
+#     build. Specifically --
+#       * Rust was compiled for generic x86-64 for the entire project history
+#         because cflags never reach rustc (278 rlibs, incl. font shaping and
+#         image decode). args.gn looked perfect throughout.
+#       * -mtune=skylake-avx512 builds cleanly and emits ZERO 512-bit
+#         instructions, silently discarding the point of the build.
+#       * An -mllvm flag inherited from Thorium was measured to be inert.
+#     So assert the generated ninja, not the intent.
+$ninjaDir = Join-Path $SrcDir "out\thorium-$Profile"
+$toolchainNinja = Join-Path $ninjaDir "toolchain.ninja"
+$result.emitted_flags = @{}
+if ((Test-Path $toolchainNinja) -and $Profile -eq "zen5") {
+    $tn = Get-Content $toolchainNinja -Raw
+
+    $expectMarch = $flags["zen5_march"]
+    $expectMtune = $flags["zen5_mtune"]
+    if ($expectMarch) { $expectMarch = $expectMarch.Trim('"') }
+    if ($expectMtune) { $expectMtune = $expectMtune.Trim('"') }
+
+    $checks = @(
+        @{ name = "cxx_march";  pattern = "-march=$expectMarch";        what = "C++ -march" },
+        @{ name = "cxx_mtune";  pattern = "-mtune=$expectMtune";        what = "C++ -mtune" },
+        @{ name = "rust_cpu";   pattern = "-Ctarget-cpu=$expectMarch";  what = "Rust -Ctarget-cpu" }
+    )
+    foreach ($c in $checks) {
+        $present = $tn.Contains($c.pattern)
+        $result.emitted_flags[$c.name] = $present
+        if (-not $present) {
+            Add-Err ("Profile '$Profile': " + $c.what + " never reached the generated build files " +
+                     "(expected '" + $c.pattern + "' in toolchain.ninja). The GN arg is set but the " +
+                     "flag is not being emitted -- this is exactly the failure mode that hid Rust " +
+                     "being built at the generic x86-64 baseline.")
+        }
+    }
+
+    # The two toolchain workarounds are load-bearing: without them the build
+    # does not link at all (see docs/TOOLCHAIN-BUGS.md). Their absence is a
+    # loud failure rather than a silent one, but check anyway so that a future
+    # edit that drops them is caught here rather than 90 minutes into a build.
+    foreach ($w in @(
+        @{ name = "tail_merge_workaround"; pattern = "enable-tail-merge=false"; issue = "llvm#199290" },
+        @{ name = "slp_cap_workaround";    pattern = "slp-max-reg-size=";      issue = "X86 ISel zero_extend_vector_inreg" }
+    )) {
+        $present = $tn.Contains($w.pattern)
+        $result.emitted_flags[$w.name] = $present
+        if (-not $present) {
+            Add-Warn ("Workaround for " + $w.issue + " ('" + $w.pattern + "') is not present in " +
+                      "toolchain.ninja. If the toolchain has been fixed upstream this is correct and " +
+                      "the knob should be retired in gn/win_zen5_args.gn; otherwise the build will fail to link.")
+        }
+    }
+} elseif ($Profile -eq "zen5") {
+    Add-Warn "No toolchain.ninja at $toolchainNinja -- cannot verify the flags were actually emitted (run build.ps1 configure)."
+}
+
 # 6. Expected signing/package configuration -- Thorium Zen5 is unsigned by
 #    default (personal build; see docs/BUILD.md 'Code signing'). Flag it as
 #    an explicit, expected state rather than a silent gap.

@@ -117,6 +117,42 @@ if ($chromiumChanged -and $localTag) {
     Log "Chromium tag changing $localTag -> $latestTag. The zen5 patches anchor into build/config/compiler/BUILD.gn; apply_zen5_patches.py will verify those anchors and stop the pipeline if upstream moved them." "WARN"
 }
 
+# 3b. Track the CLANG revision, not just the Chromium version.
+#
+#     The two toolchain workarounds this build carries (tail-merge disabled for
+#     llvm#199290, SLP capped at 256 bits for an X86 ISel gap) are pinned to a
+#     specific clang. One of them -- the SLP cap -- is ALREADY FIXED in a newer
+#     clang: verified by running the reproducer against Chromium trunk's roll.
+#
+#     Chromium rolls clang frequently, so these are meant to retire themselves.
+#     Without a reminder they would instead sit in gn/win_zen5_args.gn forever,
+#     quietly costing optimisation on a toolchain that no longer needs them.
+#     So: record the revision, and say something when it moves.
+$clangRevFile = Join-Path $BuildDir "clang-revision.txt"
+$updatePy = Join-Path $SrcDir "tools\clang\scripts\update.py"
+$currentClang = $null
+if (Test-Path $updatePy) {
+    $m = Select-String -Path $updatePy -Pattern "^CLANG_REVISION = '([^']+)'" | Select-Object -First 1
+    if ($m) { $currentClang = $m.Matches[0].Groups[1].Value }
+}
+$previousClang = if (Test-Path $clangRevFile) { (Get-Content $clangRevFile -Raw).Trim() } else { $null }
+if ($currentClang) {
+    if ($previousClang -and ($previousClang -ne $currentClang)) {
+        Log "clang rolled: $previousClang -> $currentClang" "WARN"
+        Log "RE-TEST THE TOOLCHAIN WORKAROUNDS. Both are pinned to the old compiler and may now be unnecessary:" "WARN"
+        Log "  1) zen5_slp_max_reg_size -- the ISel bug it works around is ALREADY FIXED upstream. Try setting it to \"\"." "WARN"
+        Log "  2) zen5_extra_target_ldflags (-mllvm:-enable-tail-merge=false) -- llvm#199290; try removing it." "WARN"
+        Log "  Fast check (~2 min each, NOT a full build):" "WARN"
+        Log "    .\build.ps1 configure -Profile zen5 -Force; .\build.ps1 build -Profile zen5 -Target root_store_tool" "WARN"
+        Log "  NOTE: -mllvm flags are not part of LLVM's ThinLTO cache key -- delete" "WARN"
+        Log "    src\out\thorium-zen5\thinlto-cache first or the link silently replays the old codegen." "WARN"
+    } elseif (-not $previousClang) {
+        Log "Recording clang revision $currentClang for future workaround re-testing."
+    }
+    Set-Content -Path $clangRevFile -Value $currentClang
+} else {
+    Log "Could not read CLANG_REVISION from $updatePy -- workaround re-test reminders disabled." "WARN"
+}
 $updateAvailable = ($chromiumChanged -or $neverBuilt)
 
 if (-not $updateAvailable) {
