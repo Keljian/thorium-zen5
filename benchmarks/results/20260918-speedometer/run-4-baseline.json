@@ -1,0 +1,20 @@
+{
+  "label": "baseline",
+  "exe": "C:\\thorium\\src\\out\\thorium-baseline\\chrome.exe",
+  "exe_sha256": "d47969866e3ea06f4c71f11aa3e9723652c9688031acf0f873cfca06066b7435",
+  "exe_mtime": "2026-09-16 17:03:19",
+  "profile_dir": "C:\\thorium\\build\\bench-20260918-090118\\prof-baseline-9318",
+  "url": "https://browserbench.org/Speedometer3.1/",
+  "started": "2026-09-18 09:08:35",
+  "browser_version": "Chrome/154.0.8037.17",
+  "webkit_version": "537.36 (@62d2fcb41a84e4dcefd8c4da7dfa534e6c482854)",
+  "v8_version": "15.4.80.5",
+  "os_process_path": "C:\\thorium\\src\\out\\thorium-baseline\\chrome.exe",
+  "page_title": "Speedometer 3.1",
+  "started_via": "benchmarkClient.start",
+  "score": 40.4,
+  "confidence": "\u00b1 2.9",
+  "full_json": null,
+  "finished": "2026-09-18 09:09:21",
+  "ok": true
+}

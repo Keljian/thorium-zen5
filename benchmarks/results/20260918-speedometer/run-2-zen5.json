@@ -1,0 +1,20 @@
+{
+  "label": "zen5",
+  "exe": "C:\\thorium\\src\\out\\thorium-zen5\\chrome.exe",
+  "exe_sha256": "56b1ee3bfd16d5eb78fdfef34a589e1c933e1bd393ae5c3c1e58b347f488507e",
+  "exe_mtime": "2026-09-17 12:46:59",
+  "profile_dir": "C:\\thorium\\build\\bench-20260918-090118\\prof-zen5-9313",
+  "url": "https://browserbench.org/Speedometer3.1/",
+  "started": "2026-09-18 09:03:23",
+  "browser_version": "Chrome/154.0.8037.17",
+  "webkit_version": "537.36 (@62d2fcb41a84e4dcefd8c4da7dfa534e6c482854)",
+  "v8_version": "15.4.80.5",
+  "os_process_path": "C:\\thorium\\src\\out\\thorium-zen5\\chrome.exe",
+  "page_title": "Speedometer 3.1",
+  "started_via": "benchmarkClient.start",
+  "score": 42.3,
+  "confidence": "\u00b1 3.6",
+  "full_json": null,
+  "finished": "2026-09-18 09:04:10",
+  "ok": true
+}

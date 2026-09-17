@@ -11,6 +11,13 @@ See `benchmarks/README.md` for how to run them.
 
 ## 2026-09-16 -- baseline vs zen5, Speedometer 3.1
 
+> **SUPERSEDED by the 2026-09-18 automated run below.** Keep this section for
+> the record, but do not cite its numbers. Its own caveat turned out to be the
+> decisive one: the launch method was never recorded, so it cannot be ruled out
+> that the process singleton fed both halves to a single browser. The
+> 2026-09-18 run removes that failure mode by construction and reaches the same
+> qualitative conclusion from sound data.
+
 ### What was compared
 
 Both builds are Chromium `154.0.8037.17`, src commit
@@ -214,3 +221,138 @@ there is one, is below what six runs can see, and that it is not where
 `-march` was expected to deliver it. Workloads that do hit vectorised code
 (media decode, image decode, canvas) were not measured and are the place to
 look next.
+
+---
+
+## 2026-09-18 -- baseline vs zen5, Speedometer 3.1, AUTOMATED
+
+**Headline: no measurable difference. +0.77% for zen5, p = 0.80. The test
+could not have detected a real effect smaller than about 8%.**
+
+This supersedes the 2026-09-16 Speedometer section. It is the first
+Speedometer comparison on this project whose provenance is proven rather than
+assumed.
+
+### Method
+
+`scripts/run_bench_suite.py`, which drives `scripts/speedometer_cdp.py` over
+the DevTools protocol. Five pairs, ten runs, fully unattended.
+
+What this harness fixes, in order of how badly it was needed:
+
+1. **Each run gets its own `--user-data-dir`.** Chromium's process singleton is
+   keyed on that directory. This is the flaw that voided 2026-09-16: launch the
+   second build while the first is running and the command line is handed to
+   the running browser, so the benchmark compares a build with itself.
+2. **Every run records the SHA256 of the binary it actually drove**, plus the
+   OS process path of the browser serving its debugging port. A run whose
+   provenance cannot be confirmed is reported, never silently averaged in.
+3. **Order alternates every pair** (baseline-first, zen5-first, ...), so
+   monotonic drift does not land entirely on whichever build always goes
+   second. This mattered -- see the drift table below.
+4. **The run is asserted to have started.** The first version of the driver
+   clicked Start with `element.click()` from `Runtime.evaluate`. That call
+   finds the button, returns without throwing, and does nothing at all:
+   Speedometer 3.1 requires a trusted user gesture. The driver sat polling for
+   a score against a completely idle browser, which was caught only because
+   chrome CPU was 0.00s over 5 seconds. It now requires section `#running` to
+   appear before it will wait for a score, so a failure to start is an
+   immediate error instead of a 15-minute timeout.
+
+Provenance actually recorded for this run:
+
+```
+distinct_binaries_confirmed : true
+baseline  d47969866e3ea06f4c71f11aa3e9723652c9688031acf0f873cfca06066b7435
+zen5      56b1ee3bfd16d5eb78fdfef34a589e1c933e1bd393ae5c3c1e58b347f488507e
+```
+
+Both builds reported `Chrome/154.0.8037.17`, V8 `15.4.80.5`, src
+`62d2fcb41a84e4dcefd8c4da7dfa534e6c482854`. All ten runs started via the
+`benchmarkClient.start` fallback -- consistent across every run, so it is not
+a confound. (The trusted `Input`-domain click works on a window that has been
+open a while but not on a freshly launched one, so the driver spends its 20s
+timeout before falling back. Cosmetic, but worth tightening.)
+
+### Per-pair scores
+
+| pair | order | baseline | zen5 | zen5 - baseline |
+|---|---|---|---|---|
+| 1 | base, zen5 | 39.4 +/-3.0 | 39.9 +/-4.0 | +0.5 |
+| 2 | zen5, base | 43.6 +/-3.8 | 42.3 +/-3.6 | -1.3 |
+| 3 | base, zen5 | 43.5 +/-3.4 | 44.6 +/-3.9 | +1.1 |
+| 4 | zen5, base | 40.4 +/-2.9 | 42.4 +/-3.3 | +2.0 |
+| 5 | base, zen5 | 40.5 +/-3.4 | 39.8 +/-3.2 | -0.7 |
+
+The sign of the difference flips three times across five pairs. That alone is
+the result.
+
+### Statistics
+
+| | baseline | zen5 | delta | test |
+|---|---|---|---|---|
+| all 5 pairs | 41.48 +/-1.94 | 41.80 +/-2.00 | **+0.77%** | Welch p=0.804; paired p=0.620 |
+| pair 2 excluded | 40.95 +/-1.77 | 41.67 +/-2.29 | +1.77% | Welch p=0.636; paired p=0.290 |
+
+Pair 2 is shown separately because the user's own installed Chromium was
+closed at 09:03:54, partway through pair 2's zen5 run. That removed a small
+background load (measured beforehand at 0.9% of one core across 12 processes)
+mid-run, making pair 2 internally asymmetric. Excluding it moves the point
+estimate up and the p-value down, and changes nothing: still not significant.
+
+**The honest limit of this experiment.** Pooled SD is about 1.97 points on a
+mean of 41.5, so with n=5 per arm the minimum detectable effect at 80% power
+is roughly **3.5 points, or 8.4%**. A 1% codegen win is far below the noise
+floor. This run does not show that the Zen 5 build is no faster; it shows that
+any difference is smaller than this setup can resolve.
+
+### Where the noise comes from
+
+Scores in chronological order:
+
+```
+p1 base 39.4   p1 zen5 39.9   p2 zen5 42.3   p2 base 43.6   p3 base 43.5
+p3 zen5 44.6   p4 zen5 42.4   p4 base 40.4   p5 base 40.5   p5 zen5 39.8
+```
+
+That is a rise-and-fall arc spanning 39.4 to 44.6 -- **5.2 points, 12.5% of the
+mean** -- peaking in the middle of the session and returning near its starting
+value. It tracks the machine, not the binaries: boost clocks and power/thermal
+state settling over a 25-minute run. It is roughly twelve times the size of the
+effect being looked for, which is exactly why the alternating order was
+necessary and why it still is not enough.
+
+To resolve a 1% effect against this SD would need on the order of n=60 per arm
+(~10 hours), or a quieter measurement: pinned clocks, a fixed fan curve, and a
+longer soak before the first run.
+
+### Why this is not surprising
+
+Speedometer 3.1 is dominated by DOM manipulation, style and layout, and JS
+execution. Three reasons the AVX-512 work should not be expected to show up
+there:
+
+* **V8 emits its own machine code at runtime.** Our compiler flags never touch
+  JIT output. V8's `CpuFeatures` tops out at AVX2/AVX_VNNI on this target, so
+  JITted JavaScript uses no AVX-512 regardless of how `chrome.dll` was built.
+* **The 512-bit code is not on this path.** The AVX-512 in the binary lives
+  mostly in Skia's raster pipeline, media and image decode, and the Rust
+  crates (font shaping, image decode). Speedometer exercises comparatively
+  little of it.
+* **DOM and layout do not vectorise.** They are pointer-chasing and
+  branch-heavy, which is a scheduling and branch-prediction workload, not a
+  SIMD one.
+
+### What this means for the build config
+
+Unchanged from the earlier reading, and now on sound evidence: the zen5
+profile's deviations from stock (`-enable-tail-merge=false`,
+`slp-max-reg-size=256`, `-mtune=znver5`) are buying approximately nothing
+measurable on Speedometer, at the cost of a 2.27% larger `chrome.dll` and
+three toolchain deviations to re-verify on every Chromium roll.
+
+Nothing here says the zen5 build is *worse*. It says the win, if any, is below
+this setup's resolution and is not where `-march` was expected to deliver it.
+The place to look next is work that actually reaches the vectorised code:
+canvas and raster (MotionMark, under the controlled harness this time), image
+decode, and media decode.

@@ -122,21 +122,29 @@ need a build that varies only that flag. Not measured, so not claimed.
 
 ### Performance, honestly
 
-**Speedometer 3.1, baseline vs zen5: +1.32% (n=30, p=0.52). Not
-significant.** This is the only controlled comparison that exists, and it
-carries its own caveat: how the two browsers were launched was not recorded,
-so the process singleton may have fed both runs to the same binary. See
-`docs/BENCHMARKS.md`.
+**Speedometer 3.1, baseline vs zen5: +0.77%, p = 0.80, n=5 pairs. Not
+significant.** Measured 2026-09-18 by `scripts/run_bench_suite.py`, ten
+unattended runs with alternating order, each run recording the SHA256 of the
+binary it drove. This replaces the 2026-09-16 result, which could not rule out
+having measured the same binary twice.
+
+The limit matters as much as the number: pooled SD was 1.97 points on a mean of
+41.5, so **this test could only have detected an effect larger than about
+8.4%**. It does not show the Zen 5 build is no faster; it shows any difference
+is below what five pairs can resolve. Scores drifted 5.2 points (12.5%) across
+the session on machine state alone -- twelve times the effect being sought.
 
 **MotionMark: 2935.64 (+/-2.01%) zen5 vs 1305.84 (+/-31.57%) baseline.
 Recorded, not believed.** A 2.2x on a graphics benchmark is not a plausible
 consequence of instruction selection, and the baseline run's +/-31.57%
-variance says that run was unstable rather than slow. Treat it as an
-unvalidated observation until it is re-run under
-`scripts\Start-BenchBrowser.ps1`.
+variance says that run was unstable rather than slow. It predates the
+controlled harness and should be re-run under it.
 
 So: the codegen change is real and verified; a user-visible speedup is not
-established. Those are two different claims and this file keeps them apart.
+established, and Speedometer is the wrong place to look for one. V8 emits its
+own machine code at runtime and tops out at AVX2, so JITted JavaScript uses no
+AVX-512 however `chrome.dll` was built -- the 512-bit code lives in Skia
+raster, media and image decode, and the Rust crates. See `docs/BENCHMARKS.md`.
 
 ### Installed
 
