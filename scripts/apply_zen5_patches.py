@@ -172,6 +172,22 @@ declare_args() {{
   # silent.
   zen5_mtune = "generic"
 
+  # CPU target for RUST code. "" follows the C++ target (zen5_march, or
+  # skylake-avx512 for the generic profile). "none" leaves Rust at the stock
+  # generic x86-64 baseline.
+  #
+  # This existed as a silent gap: cflags never reach rustc, so before this
+  # arg every line of Rust in Chromium was compiled for generic x86-64 while
+  # all the C++ was compiled for Zen 5. That is not a rounding error --
+  # measured on this build, 278 rlibs, including:
+  #     read_fonts 18MB, skrifa 5MB, harfrust 5MB   (font parsing + shaping)
+  #     png, zune_jpeg, rust_jpeg_ffi, crabbyavif,
+  #     image, jxl                                   (image decoding)
+  #     moxcms (colour management), symphonia (audio), rustfft
+  # Font shaping and image decode run on essentially every page load, so the
+  # gap sat directly on the hot path.
+  zen5_rust_target_cpu = ""
+
   # Cap the SLP vectorizer's register size (bits) for CPU-targeted builds.
   # "" leaves it at the target default.
   #
@@ -251,6 +267,28 @@ TARGETING_BLOCK = '''
       }}
       cflags += zen5_extra_target_cflags
       ldflags += zen5_extra_target_ldflags
+
+      # Rust gets the same CPU target as C++.
+      #
+      # rustc here is built against the SAME LLVM revision as the bundled
+      # clang (llvmorg-24-init-3796-g20e97c4b), so it accepts the same -Ctarget-cpu
+      # names AND is subject to the same backend bugs. The -mllvm workarounds in
+      # ldflags cover Rust too, because Rust participates in ThinLTO here
+      # (-Clinker-plugin-lto=yes), so its codegen happens in the same LTO backend.
+      #
+      # rustflags is initialised at the top of config("compiler"), before this
+      # block, so += is safe.
+      _rust_cpu = zen5_rust_target_cpu
+      if (_rust_cpu == "") {{
+        if (use_znver5) {{
+          _rust_cpu = zen5_march
+        }} else {{
+          _rust_cpu = "skylake-avx512"
+        }}
+      }}
+      if (_rust_cpu != "none") {{
+        rustflags += [ "-Ctarget-cpu=$_rust_cpu" ]
+      }}
 
       if (zen5_slp_max_reg_size != "") {{
         if (use_thin_lto) {{
