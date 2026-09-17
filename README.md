@@ -171,6 +171,11 @@ version resource instead.
   lookup service are inactive.
 - `scripts/attribute_isa.py` (per-component, per-operation vector
   attribution) is committed but has never been run.
+- The build volume is **NTFS-compressed at roughly 2.0:1** on this tree
+  (250,033 files, 17.5 GB logical stored in 8.7 GB). Byte counts from
+  `Get-ChildItem`/`.Length` are logical sizes, so actual disk usage -- and
+  anything reclaimed by deleting build output -- is about half what they say.
+  The binary sizes above are file sizes and are unaffected.
 - `verify-source.ps1` now skips `git fsck` on the Chromium checkout by
   default; it cost 30-60+ minutes of solid CPU and starved the checks that
   actually catch regressions. Pass `-DeepFsck` when you specifically suspect
