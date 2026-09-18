@@ -33,6 +33,16 @@
 .PARAMETER SkipBenchmark
     Skip the benchmark stage entirely. The benchmark is non-gating either way
     (see the stage comment); this just saves the time.
+
+.NOTES
+    Exit codes:
+        0   nothing to do, or the pipeline completed
+        1   a stage failed (see build\logs\update.log)
+        2   patch conflict -- upstream moved the zen5 patch anchors
+        3   source verification failed: the CPU targeting did not reach the
+            generated build files. Nothing is built from an unverified tree.
+        10  -CheckOnly: a rebuild is needed
+        11  another run (or a build in the same out dir) is already in progress
 #>
 [CmdletBinding()]
 param(
@@ -99,6 +109,42 @@ trap {
         Log "Could not raise the failure notification: $_" "WARN"
     }
     exit 1
+}
+
+# 0. ONE PIPELINE AT A TIME.
+#
+#    Two concurrent runs corrupt each other. Both call `git fetch` on the same
+#    ~30 GB checkout and git fails the ref update outright:
+#
+#        error: fetching ref refs/remotes/origin/main failed:
+#               incorrect old value provided
+#
+#    Observed 2026-09-18 11:38:52, when a second run started 22 seconds into the
+#    first one's sync. The second died in sync; the first survived and went on to
+#    build. Which one survives is a coin toss, and both write to the same
+#    update.log, interleaved, which makes the outcome nearly unreadable
+#    afterwards. Double-clicking update.cmd twice is all it takes.
+#
+#    A named mutex rather than a PID file: the OS releases it when the process
+#    dies, so a crash or a kill cannot leave a stale lock behind.
+$script:UpdateMutex = New-Object System.Threading.Mutex($false, 'Global\ThoriumZen5-update')
+if (-not $script:UpdateMutex.WaitOne(0)) {
+    Log ("Another update.ps1 is already running. Refusing to start a second one: concurrent runs " +
+         "collide on 'git fetch' in the shared checkout and interleave into this log. Watch the " +
+         "existing run with: Get-Content build\logs\update.log -Wait") "WARN"
+    exit 11
+}
+
+#    The mutex only sees runs that carry this code. A build already in flight --
+#    started before this lock existed, or by a hand-run of build.ps1 -- is
+#    detected separately, by looking for the build driver working in our out dir.
+$builders = @(Get-CimInstance Win32_Process -Filter "Name='siso.exe' OR Name='ninja.exe'" -ErrorAction SilentlyContinue |
+              Where-Object { $_.CommandLine -and $_.CommandLine -match [regex]::Escape("thorium-$Profile") })
+if ($builders.Count -gt 0) {
+    Log ("A build is already running in out\thorium-$Profile ($($builders[0].Name) pid " +
+         "$($builders[0].ProcessId)). Refusing to start a second pipeline on the same output " +
+         "directory. Wait for it to finish, or stop it first.") "WARN"
+    exit 11
 }
 
 # 1. Is there a newer Chromium stable release than the one we last synced?

@@ -1,5 +1,32 @@
 # Keeping Thorium Zen5 up to date
 
+## Just double-click one of these
+
+Launchers in the repo root. No flags, no PowerShell, no remembering anything.
+Each one `cd`s to its own directory, silences mimalloc for its own window (see
+"Allocator noise" below), prints a pass/fail banner and pauses so the window does
+not vanish. Set `THORIUM_NOPAUSE=1` to suppress the pause for scripted use; extra
+arguments are forwarded to the underlying script.
+
+| file | what it does | time |
+|---|---|---|
+| `check.cmd` | Is a rebuild needed? Exit 10 = yes | seconds |
+| `update.cmd` | The lot: sync, patch, **verify**, build, test, ISA report, package, installer, silent install | hours |
+| `sync.cmd` | Refresh the checkout only. **Reverts the Zen 5 patches** until you configure again | minutes |
+| `install.cmd` | Silently install the build already in `src\out\thorium-zen5` | seconds |
+| `verify.cmd` | Assert the targeting reached the compiler | seconds |
+
+`update.cmd` runs with `-Yes -Install -SkipBenchmark`: no prompt, install the
+result, skip the non-gating benchmark.
+
+**Only one pipeline can run at a time.** `update.ps1` takes a named mutex and
+also refuses if a build driver is already working in the same output directory,
+exiting **11** either way. This is not theoretical: on 2026-09-18 a second run
+started 22 seconds into the first one's sync, both called `git fetch` on the same
+~30 GB checkout, and git failed the ref update with *"incorrect old value
+provided"*. Which run survives is a coin toss, and both write into the same
+`update.log` interleaved. Double-clicking `update.cmd` twice is all it takes.
+
 ## Manual
 
 ```powershell
@@ -286,3 +313,50 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\thorium\update.ps1 -C
 Exit code `10` means an update is available. The `-CheckOnly` path never
 installs or publishes anything: nothing ships without completing the
 build/test pipeline first.
+
+## Exit codes
+
+| code | meaning |
+|---|---|
+| 0 | nothing to do, or the pipeline completed |
+| 1 | a stage failed -- see `build\logs\update.log` |
+| 2 | patch conflict: upstream moved the zen5 patch anchors |
+| 3 | **source verification failed** -- the CPU targeting did not reach the generated build files. Nothing is built from an unverified tree. |
+| 10 | `-CheckOnly`: a rebuild is needed |
+| 11 | another run, or a build in the same out dir, is already in progress |
+
+## Allocator noise, and why the scripts force it off
+
+`MIMALLOC_VERBOSE=1` is set at **user scope** on this machine (alongside
+`MIMALLOC_PURGE_DELAY=-1`, which is a legitimate git performance tweak).
+depot_tools' git runs on mimalloc, so with that variable set **every `git`
+invocation prints about seventy lines of allocator statistics**:
+
+```
+v2.2.7 (built on Feb  2 2026, 17:39:08)
+option 'show_stats': 0
+reserved 1048576 KiB memory
+user: 0.968 s, system: 4.656 s, faults: 87588, peak rss: 266.7 MiB
+```
+
+On 2026-09-18 `verify-source.ps1` parsed that into seventy "unexpected local
+modification" errors -- one per line of allocator output -- and failed a
+completely clean tree, stopping a security update before the build. The old
+parser did `$path = ($line -replace '^\S+\s+', '')` on a `2>&1`-merged capture,
+which turns *any* text into a filename.
+
+Two defences, because either alone is fragile:
+
+1. **Strict parsing.** `git status --porcelain` v1 is exactly two status
+   characters, a space, then the path. Anything else is collected and reported
+   *as unparseable output*, naming the one real problem instead of inventing
+   seventy fake ones. `git rev-parse` output is likewise filtered to an actual
+   40-hex sha, so noise can never be stored as a commit revision.
+2. **`MIMALLOC_VERBOSE`/`SHOW_STATS`/`SHOW_ERRORS` forced to `0`** at the top of
+   `update.ps1` and `verify-source.ps1`, and in each `.cmd`. **Process scope
+   only** -- your own environment is deliberately left alone.
+
+If you want the noise gone everywhere else too (it will affect any other tool
+that parses git output), remove `MIMALLOC_VERBOSE` from your user environment
+variables and keep `MIMALLOC_PURGE_DELAY`. That is a change to your environment,
+so the scripts do not make it for you.
