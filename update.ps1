@@ -22,13 +22,26 @@
 
 .PARAMETER Yes
     Skip the confirmation prompt before starting the (long) full pipeline.
+
+.PARAMETER Install
+    After a successful build, silently install it on THIS machine with
+    mini_installer.exe (user-level, no UI, does not launch the browser).
+    Off by default: the pipeline's normal ending is to OFFER the update via
+    scripts\Check-ThoriumUpdate.ps1 rather than to replace a running browser
+    underneath you.
+
+.PARAMETER SkipBenchmark
+    Skip the benchmark stage entirely. The benchmark is non-gating either way
+    (see the stage comment); this just saves the time.
 #>
 [CmdletBinding()]
 param(
     [switch]$CheckOnly,
     [ValidateSet("baseline", "zen5", "generic-avx512")]
     [string]$Profile = "zen5",
-    [switch]$Yes
+    [switch]$Yes,
+    [switch]$Install,
+    [switch]$SkipBenchmark
 )
 
 $ErrorActionPreference = "Stop"
@@ -100,12 +113,65 @@ if ($localTag -and -not $chromiumChanged -and $localTag -ne $latestTag) {
     Log "Resolved stable ($latestTag) is NOT newer than the synced tag ($localTag). Refusing to downgrade; treating as up to date." "WARN"
 }
 
-# 2. Have we ever produced a build for this profile? If not, treat as changed
-#    so a first run does something useful rather than reporting "up to date".
+# 2. WHAT WAS ACTUALLY BUILT -- which is NOT what was last synced.
+#
+#    THIS IS THE BUG THAT SILENCED THE PIPELINE. The up-to-date test used to be
+#    chromium-tag.txt (written by the `sync` stage) versus chromiumdash. So a
+#    run that synced successfully and then FAILED at any later stage had already
+#    advanced the tag file -- and every subsequent run concluded "already up to
+#    date, nothing to do", while the machine kept running the OLD build. The
+#    pipeline goes permanently quiet, and from outside that is indistinguishable
+#    from a quiet week upstream. It is exactly the silent-security-drift failure
+#    the trap at the top of this file was written to prevent, and the trap could
+#    not see it because nothing threw.
+#
+#    It happened for real on 2026-09-18: sync moved .17 -> .44, configure died
+#    on the argument-splat bug above, and the next check reported nothing to do
+#    with a .17 browser installed and .44 shipped.
+#
+#    Ground truth for "what is built" is the version resource of the binary we
+#    produced. A marker file can drift from reality; the binary cannot.
 $lastManifest = Join-Path $BuildDir "build-manifest-$Profile.json"
-$neverBuilt = -not (Test-Path $lastManifest)
+$builtExe = Join-Path $SrcDir "out\thorium-$Profile\chrome.exe"
+$builtVersion = $null
+if (Test-Path $builtExe) {
+    $builtVersion = (Get-Item $builtExe).VersionInfo.FileVersion
+}
+
+# What is actually installed on this machine, for the same reason.
+$installedExe = Join-Path $env:LOCALAPPDATA "Chromium\Application\chrome.exe"
+$installedVersion = $null
+if (Test-Path $installedExe) {
+    $installedVersion = (Get-Item $installedExe).VersionInfo.FileVersion
+}
+
+Log "Versions: upstream-stable=$latestTag  synced=$localTag  built=$builtVersion  installed=$installedVersion"
+
+$neverBuilt = (-not $builtVersion) -or (-not (Test-Path $lastManifest))
 if ($neverBuilt) {
-    Log "No prior build-manifest for profile '$Profile' -- treating as changed (first build)."
+    Log "No usable prior build for profile '$Profile' (built=$builtVersion, manifest=$(Test-Path $lastManifest)) -- treating as a first build."
+}
+
+# The question is whether upstream is ahead of what we BUILT.
+$buildIsStale = Test-ChromiumVersionIsNewer -Candidate $latestTag -Current $builtVersion
+if ($buildIsStale -and $builtVersion) {
+    Log "Upstream stable $latestTag is NEWER than the built binary $builtVersion -- a rebuild is required." "WARN"
+}
+
+# A built-but-not-installed gap is its own problem: the build succeeded and
+# nobody is running it. Report it rather than leaving it to be noticed.
+if ($builtVersion -and $installedVersion -and
+    (Test-ChromiumVersionIsNewer -Candidate $builtVersion -Current $installedVersion)) {
+    Log ("Built $builtVersion but only $installedVersion is installed. Install it with " +
+         "'.\update.ps1 -Install' or run: $SrcDir\out\thorium-$Profile\mini_installer.exe --do-not-launch-chrome") "WARN"
+}
+
+# A synced tree ahead of the built binary means a previous run got part way.
+# Worth saying out loud, because it is the fingerprint of the failure above.
+if ($localTag -and $builtVersion -and
+    (Test-ChromiumVersionIsNewer -Candidate $localTag -Current $builtVersion)) {
+    Log ("The CHECKOUT is at $localTag but the last successful build is $builtVersion -- a previous run " +
+         "synced and then failed before producing a binary. Continuing; this run will rebuild.") "WARN"
 }
 
 # 3. A Chromium version bump is also the signal that our patch anchors may have
@@ -153,15 +219,20 @@ if ($currentClang) {
 } else {
     Log "Could not read CLANG_REVISION from $updatePy -- workaround re-test reminders disabled." "WARN"
 }
-$updateAvailable = ($chromiumChanged -or $neverBuilt)
+# Rebuild if upstream is ahead of the BUILT binary, if we have never built, or
+# if the checkout has moved ahead of the built binary (a part-completed run).
+# Deliberately NOT keyed on chromium-tag.txt alone -- see section 2.
+$updateAvailable = ($buildIsStale -or $neverBuilt -or
+                    ($localTag -and $builtVersion -and
+                     (Test-ChromiumVersionIsNewer -Candidate $localTag -Current $builtVersion)))
 
 if (-not $updateAvailable) {
-    Log "Already on Chromium stable $localTag with a completed build for profile '$Profile'. Nothing to do."
+    Log "Up to date: upstream stable $latestTag, built $builtVersion, installed $installedVersion. Nothing to do."
     exit 0
 }
 
 if ($CheckOnly) {
-    Log "CheckOnly: update available (chromium: $localTag -> $latestTag, never-built=$neverBuilt). Exiting without fetching/building."
+    Log "CheckOnly: rebuild needed (upstream=$latestTag built=$builtVersion synced=$localTag never-built=$neverBuilt). Exiting without fetching/building."
     exit 10   # distinct code: "update available" for Task Scheduler / scripts to key off of
 }
 
@@ -174,26 +245,42 @@ function Invoke-Stage {
     <#
     Run one build.ps1 stage and stop the pipeline if it fails.
 
-    The previous code did `& "$RepoRoot\build.ps1" <stage>` then checked
-    $LASTEXITCODE. That check was meaningless: $LASTEXITCODE is only set by
-    NATIVE commands, so after invoking a .ps1 it still holds whatever value
-    the last native process left behind -- possibly from deep inside
-    build.ps1, including an exit code that Invoke-Logged deliberately
-    tolerated via -AllowedExitCodes. It could therefore both miss a real
-    failure and invent one that did not happen.
+    ARGUMENT PASSING -- THE BUG THAT BROKE THIS PIPELINE ENTIRELY.
 
-    build.ps1 runs with $ErrorActionPreference = "Stop" and throws on any
-    stage failure, so the exception IS the reliable signal.
+    -Params is a HASHTABLE, splatted. It used to be a [string[]] splatted as
+    `@StageArgs`, e.g. @("configure", "-Profile", $Profile, "-Force"), and that
+    is silently wrong: ARRAY splatting passes every element POSITIONALLY. So
+    "-Profile" arrived as a positional VALUE, not a parameter name, and
+    build.ps1 -- which takes exactly one positional parameter ($Command) --
+    failed with:
+
+        A positional parameter cannot be found that accepts argument '-Profile'.
+
+    Only `sync`, the one stage passing no named parameters, ever worked. This
+    pipeline had therefore NEVER completed an upgrade. It looked healthy purely
+    because every run before 2026-09-18 exited at the up-to-date check without
+    reaching a stage; the first run with real work to do synced ~30 GB and then
+    died on the very next line.
+
+    Verified empirically rather than reasoned about: array splat throws,
+    hashtable splat binds correctly.
+
+    $LASTEXITCODE is deliberately NOT consulted here. It is only set by NATIVE
+    commands, so after invoking a .ps1 it holds whatever a previous native
+    process left behind -- possibly an exit code Invoke-Logged deliberately
+    tolerated via -AllowedExitCodes. build.ps1 runs with
+    $ErrorActionPreference = "Stop" and throws, so the exception IS the signal.
     #>
     param(
         [Parameter(Mandatory)][string]$Name,
-        [Parameter(Mandatory)][string[]]$StageArgs,
+        [Parameter(Mandatory)][string]$Command,
+        [hashtable]$Params = @{},
         [string]$FailMessage = $null,
         [int]$FailExit = 1
     )
     Log "Stage: $Name"
     try {
-        & "$RepoRoot\build.ps1" @StageArgs
+        & "$RepoRoot\build.ps1" $Command @Params
     } catch {
         $msg = if ($FailMessage) { $FailMessage } else { "$Name failed -- stopping pipeline (no release will be produced)." }
         Log "$msg Detail: $_" "ERROR"
@@ -211,24 +298,71 @@ function Invoke-Stage {
 }
 
 # 4. fetch source (build.ps1 sync handles both Chromium and the Thorium meta-repo)
-Invoke-Stage -Name "sync" -StageArgs @("sync")
+Invoke-Stage -Name "sync" -Command "sync"
 
 # 5. rebase / reapply zen5 patches -- build.ps1 configure calls
 #    apply_zen5_patches.py, which exits 3 (and configure propagates the
 #    failure) if a marker is no longer found. We surface that distinctly.
 Invoke-Stage -Name "configure (reapplies zen5 patches; stops on patch conflict)" `
-    -StageArgs @("configure", "-Profile", $Profile, "-Force") `
+    -Command "configure" -Params @{ Profile = $Profile; Force = $true } `
     -FailMessage "PATCH CONFLICT or configure failure. Upstream Thorium's compiler-flag files may have changed shape. See patches/zen5/README.md 'Regenerating after upstream changes'. STOPPING -- no build will be attempted from an unpatched/half-patched tree." `
     -FailExit 2
 
+# 5b. ASSERT THE ZEN 5 TARGETING ACTUALLY SURVIVED THE UPGRADE.
+#
+#     This is the check this pipeline most needed and did not have. The
+#     patches applying cleanly is NOT the same as the flags reaching the
+#     compiler, and the gap between those two is invisible in a green build.
+#     It has already bitten this project twice:
+#
+#       * Rust was compiled for generic x86-64 for the project's ENTIRE
+#         history, because GN cflags never reach rustc. 278 rlibs, including
+#         font shaping and image decode. args.gn looked perfect throughout.
+#       * -mtune=skylake-avx512 builds cleanly and emits ZERO 512-bit
+#         instructions, silently discarding the whole point of the build.
+#
+#     A Chromium roll is exactly when this class of failure appears, so it is
+#     checked here, before spending hours on a build. verify-source.ps1
+#     asserts the GENERATED NINJA -- -march, -mtune, -Ctarget-cpu, and both
+#     linker workarounds -- rather than the intent, and exits non-zero if any
+#     of them is missing.
+#
+#     Hard stop: shipping a build labelled "Zen 5" that is silently generic is
+#     worse than not shipping.
+#
+#     $LASTEXITCODE is meaningful here, unlike after the .ps1 calls that
+#     Invoke-Stage wraps, because powershell.exe is a NATIVE command. Do not
+#     "simplify" this to `& $verifyScript`; that reintroduces the bug
+#     documented in Invoke-Stage.
+Log "Stage: verify (asserts -march/-mtune/-Ctarget-cpu and the toolchain workarounds reached the generated build files)"
+$verifyScript = Join-Path $RepoRoot "verify-source.ps1"
+if (-not (Test-Path $verifyScript)) {
+    Log "verify-source.ps1 is missing -- cannot confirm the zen5 targeting survived. STOPPING." "ERROR"
+    exit 3
+}
+& powershell.exe -NoProfile -ExecutionPolicy Bypass -File $verifyScript -Profile $Profile
+if ($LASTEXITCODE -ne 0) {
+    $vmsg = ("SOURCE VERIFICATION FAILED (exit $LASTEXITCODE). The zen5 targeting did not reach the " +
+             "generated build files, or the tree differs from the pinned tag in an unexpected way. " +
+             "Read build\\source-verification.json -- in particular emitted_flags: cxx_march, cxx_mtune, " +
+             "rust_cpu, tail_merge_workaround, slp_cap_workaround. STOPPING before the build: a green " +
+             "build would hide this.")
+    Log $vmsg "ERROR"
+    try {
+        Show-ThoriumFailureNotice -Stage "verify" -Detail $vmsg -LogPath $LogFile -TimeoutMinutes 5 | Out-Null
+    } catch { Log "Could not raise the failure notification: $_" "WARN" }
+    exit 3
+}
+Log "verify OK -- the CPU targeting is present in the generated build files."
+
 # 6. rebuild
-Invoke-Stage -Name "build" -StageArgs @("build", "-Profile", $Profile)
+Invoke-Stage -Name "build" -Command "build" -Params @{ Profile = $Profile }
 
 # 7. test
-Invoke-Stage -Name "test" -StageArgs @("test", "-Profile", $Profile) -FailMessage "tests failed -- stopping pipeline (no release will be produced)."
+Invoke-Stage -Name "test" -Command "test" -Params @{ Profile = $Profile } -FailMessage "tests failed -- stopping pipeline (no release will be produced)."
 
 # 8. ISA analysis
-Invoke-Stage -Name "analyze" -StageArgs @("analyze", "-Profile", $Profile) -FailMessage "ISA analysis failed -- stopping."
+Invoke-Stage -Name "analyze" -Command "analyze" -Params @{ Profile = $Profile } -FailMessage "ISA analysis failed -- stopping."
 
 # 8b. Regression check against the previous successful build's ISA report
 $prevIsa = Join-Path $BuildDir "isa-report-$Profile.previous.json"
@@ -241,14 +375,38 @@ if (Test-Path $prevIsa) {
     }
 }
 
-# 9. benchmark
-Invoke-Stage -Name "benchmark" -StageArgs @("benchmark", "-Profile", $Profile) -FailMessage "benchmark failed -- stopping (non-fatal data, but per spec we don't package without it)."
+# 9. benchmark -- DELIBERATELY NON-GATING.
+#
+# This used to stop the pipeline, on the reasoning that we "don't package
+# without it". That is the wrong trade for what this project actually is. The
+# pipeline exists to deliver Chromium SECURITY updates to one machine, and the
+# benchmark is by far its least reliable stage: it drives a real browser
+# against a real network. A flaky benchmark must never be the reason a security
+# fix goes unpackaged.
+#
+# It also is not load-bearing for any decision. docs/BENCHMARKS.md records the
+# measured position: the Zen 5 build shows no significant Speedometer
+# difference (+0.77%, p=0.80), and that test could only have resolved an effect
+# above ~8.4% anyway. Results are recorded when they work and skipped loudly
+# when they do not.
+if ($SkipBenchmark) {
+    Log "Stage: benchmark SKIPPED (-SkipBenchmark)."
+} else {
+    Log "Stage: benchmark (non-gating -- a failure here will not stop the release)"
+    try {
+        & "$RepoRoot\build.ps1" benchmark -Profile $Profile
+    } catch {
+        Log ("benchmark failed -- CONTINUING, because this stage is not allowed to block a " +
+             "security update. Re-run '.\build.ps1 benchmark -Profile $Profile' if you want the " +
+             "numbers. Detail: $_") "WARN"
+    }
+}
 
 # 10. package only if everything above succeeded
-Invoke-Stage -Name "package" -StageArgs @("package", "-Profile", $Profile) -FailMessage "package failed -- stopping."
+Invoke-Stage -Name "package" -Command "package" -Params @{ Profile = $Profile } -FailMessage "package failed -- stopping."
 
 # 11. installer -- only now, after full validation
-Invoke-Stage -Name "installer" -StageArgs @("installer", "-Profile", $Profile) -FailMessage "installer build failed -- stopping."
+Invoke-Stage -Name "installer" -Command "installer" -Params @{ Profile = $Profile } -FailMessage "installer build failed -- stopping."
 
 # 12. publish to GitHub Releases.
 #
@@ -268,6 +426,51 @@ try {
 
 Copy-Item $curIsa $prevIsa -Force
 Log "=== update.ps1 complete: release candidate produced for profile '$Profile' (published=$published) ==="
+
+# 12b. Optionally install it here, silently.
+#
+#      Off by default on purpose: replacing the browser underneath a running
+#      session is not something an unattended 03:00 job should do by itself,
+#      which is why the normal ending is to OFFER the update (section 13).
+#
+#      This is the path that was actually verified by hand: mini_installer.exe
+#      installs user-level into %LOCALAPPDATA%\Chromium\Application, adopts the
+#      existing profile in %LOCALAPPDATA%\Chromium\User Data in place, and
+#      registers in Add/Remove Programs. --do-not-launch-chrome keeps it silent.
+#
+#      NOTE: on Windows `chrome.exe --version` does NOT print and exit -- it
+#      ignores the flag and launches the browser. Read the version from the
+#      file's version resource, as below.
+if ($Install) {
+    Log "Stage: install (silent, user-level)"
+    $mini = Join-Path $SrcDir "out\thorium-$Profile\mini_installer.exe"
+    if (-not (Test-Path $mini)) {
+        Log "mini_installer.exe not found at $mini -- skipping install." "WARN"
+    } else {
+        $appDir = Join-Path $env:LOCALAPPDATA "Chromium\Application"
+        $running = @(Get-Process chrome -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Path -and $_.Path.StartsWith($appDir, [StringComparison]::OrdinalIgnoreCase) })
+        if ($running.Count -gt 0) {
+            Log ("The installed Chromium is running ($($running.Count) processes). Not replacing a " +
+                 "browser in use -- close it and re-run '.\update.ps1 -Install', or install manually: " +
+                 "$mini --do-not-launch-chrome") "WARN"
+        } else {
+            try {
+                $proc = Start-Process -FilePath $mini -ArgumentList '--do-not-launch-chrome','--verbose-logging' `
+                            -PassThru -Wait -WindowStyle Hidden
+                $installed = Join-Path $appDir "chrome.exe"
+                if (Test-Path $installed) {
+                    $fv = (Get-Item $installed).VersionInfo.FileVersion
+                    Log "installed: $installed (version resource: $fv, installer exit $($proc.ExitCode))"
+                } else {
+                    Log "mini_installer exited $($proc.ExitCode) but $installed is absent -- install did not take." "WARN"
+                }
+            } catch {
+                Log "silent install failed (non-fatal; the packaged build is fine): $_" "WARN"
+            }
+        }
+    }
+}
 
 # 13. Offer it. The machine that builds and the machine being updated are the
 #     same one, so this checks releases\ directly rather than making a round

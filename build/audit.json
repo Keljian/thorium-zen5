@@ -1,14 +1,14 @@
 {
   "audit_schema_version": 1,
-  "generated_at": "2026-09-17T01:51:41.786745+00:00",
+  "generated_at": "2026-09-18T01:22:50.767201+00:00",
   "status": "OK",
-  "chromium_version": "154.0.8037.17",
-  "chromium_tag": "154.0.8037.17",
-  "chromium_src_commit": "62d2fcb41a84e4dcefd8c4da7dfa534e6c482854",
+  "chromium_version": "154.0.8037.44",
+  "chromium_tag": "154.0.8037.44",
+  "chromium_src_commit": "94c94374d18e0bfd060bd42b5c26fab9f1ec3235",
   "compiler": {
     "path": "C:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\clang-cl.exe",
     "found": true,
-    "version_string": "clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com/llvm/llvm-project 75adca17d7f5f488193fdf76cd07500e2a12081a)\nTarget: x86_64-pc-windows-msvc\nThread model: posix\nInstalledDir: C:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\nBuild config: +alloc:rpmalloc",
+    "version_string": "clang version 24.0.0git (https://chromium.googlesource.com/a/external/github.com/llvm/llvm-project 9fca3cf47d011a0af295d4252d70f16f8693d6a2)\nTarget: x86_64-pc-windows-msvc\nThread model: posix\nInstalledDir: C:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\nBuild config: +alloc:rpmalloc",
     "supports_znver5": true,
     "znver5_probe_returncode": 0,
     "znver5_probe_output": "# 1 \"NUL\"\n# 1 \"<built-in>\" 1\n# 1 \"<built-in>\" 3\n# 460 \"<built-in>\" 3\n# 1 \"<command line>\" 1\n# 1 \"<built-in>\" 2\n# 1 \"NUL\" 2"

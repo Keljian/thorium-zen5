@@ -51,27 +51,41 @@ These are INDEPENDENT: disabling Windows unwind v2 removes (1) and leaves
 (2) untouched. Fixing -mtune removes both, which is why no unwind-v2
 workaround is needed (zen5_winunwindv2 defaults to "", clang's default).
 
-WHY -mtune=generic AND NOT -mtune=skylake-avx512
-------------------------------------------------
-Both build. Only one of them actually emits 512-bit code. prefer-256-bit is
-a TUNING feature in LLVM, so an Intel -mtune silently suppresses all
-512-bit vectorization. Measured by counting registers in the emitted
-assembly for a vectorizable loop:
+WHAT WE ACTUALLY SHIP: -mtune=znver5, VIA A TAIL-MERGE WORKAROUND
+-----------------------------------------------------------------
+NOTE: this file's declare_args DEFAULT for zen5_mtune is "generic", the
+conservative value that builds without any workaround. The zen5 profile in
+gn/win_zen5_args.gn OVERRIDES it to "znver5". Read that file for the full
+argument; the short version:
+
+  -mllvm:-enable-tail-merge=false  (an LDFLAG) avoids llvm#199290, and with
+  it in place -mtune=znver5 builds and links cleanly. So we keep the Zen 5
+  SCHEDULING model as well as the Zen 5 ISA, and pay in binary size only
+  (+2.27% on chrome.dll versus the baseline profile, though that figure also
+  includes the LTO knobs).
+
+Two other -mtune values were considered and rejected:
 
     -march / -mtune                 zmm    ymm
     ------------------------------  ----   ----
-    znver5 / znver5  (unbuildable)    72     18
+    znver5 / znver5  (SHIPPED)        72     18
     znver5 / skylake-avx512            0     72   <- no 512-bit code at all
-    znver5 / generic                  72     18   <- identical to intended
+    znver5 / generic                  72     18   <- same codegen, no Zen 5
+                                                     scheduling
     skylake-avx512 / skylake-avx512    0     72
     (stock, no -march)                 0      0
 
--mtune=generic reproduces the intended codegen exactly. What is lost is
-Zen 5's instruction scheduling model only -- the full ISA, 512-bit
-vectorization, PGO and ThinLTO are all intact.
+NEVER use an Intel -mtune here. prefer-256-bit is a TUNING feature in LLVM,
+so -mtune=skylake-avx512 builds fine and silently emits ZERO 512-bit
+instructions -- it discards the entire point of the build while looking
+completely healthy. "generic" is the safe fallback: same codegen as znver5,
+losing only the scheduling model.
 
-Set zen5_mtune back to "znver5" once LLVM fixes this; the failure is loud
-(link error), never silent.
+IF THE TAIL-MERGE LDFLAG IS EVER RETIRED (llvm#199290 fixed upstream),
+zen5_mtune must go back to "generic" in the SAME commit, and
+verify-source.ps1's expectation for it must change with it -- that script
+asserts the exact value, and it spent a while asserting the opposite of what
+was actually being built.
 
 Corrections to earlier revisions of this file
 ---------------------------------------------
@@ -158,18 +172,17 @@ declare_args() {{
   # -mtune for CPU-targeted builds -- the SCHEDULING MODEL.
   # "" means "same as zen5_march".
   #
-  # MUST NOT be znver4/znver5 on this toolchain: that is the actual bug (see
-  # the header of this file for the full matrix). "generic" is the correct
-  # workaround rather than an Intel -mtune, because prefer-256-bit is a
-  # TUNING feature -- -mtune=skylake-avx512 builds fine but emits ZERO
-  # 512-bit instructions, silently discarding the entire point of the build.
-  # "generic" reproduces the intended znver5 codegen exactly (measured:
-  # zmm 72 / ymm 18, same as znver5/znver5).
+  # This DEFAULT is the conservative one, for a tree with no workarounds
+  # applied. The shipped zen5 profile overrides it to "znver5" in
+  # gn/win_zen5_args.gn, which is safe there because that profile also sets
+  # -mllvm:-enable-tail-merge=false and that avoids llvm#199290. Bare
+  # -mtune=znver4/znver5 WITHOUT that ldflag does not link on this toolchain.
   #
-  # Cost of the workaround: Zen 5 instruction scheduling only. The ISA,
-  # 512-bit vectorization, PGO and ThinLTO are unaffected. Restore to
-  # "znver5" once LLVM fixes this -- the failure is a link error, not
-  # silent.
+  # Never set this to an Intel -mtune. prefer-256-bit is a TUNING feature, so
+  # -mtune=skylake-avx512 builds fine and emits ZERO 512-bit instructions --
+  # a silent failure that looks like a healthy build. "generic" reproduces
+  # znver5's codegen exactly (measured: zmm 72 / ymm 18) and gives up only
+  # the scheduling model, which is why it is the default here.
   zen5_mtune = "generic"
 
   # CPU target for RUST code. "" follows the C++ target (zen5_march, or

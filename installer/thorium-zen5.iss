@@ -26,7 +26,11 @@
   #error AppFilesDir must be defined (passed by build.ps1)
 #endif
 #ifndef MainExeName
-  #define MainExeName "thorium.exe"
+  ; Stock Chromium builds chrome.exe, not thorium.exe -- this project stopped
+; overlaying Thorium. build.ps1 Invoke-Installer always passes the real name
+; via /DMainExeName from the extracted archive, so this is only the fallback
+; for a manual ISCC invocation; it was left pointing at a file we never build.
+#define MainExeName "chrome.exe"
 #endif
 #ifndef ThoriumZen5Version
   #define ThoriumZen5Version "0.0.0.0"

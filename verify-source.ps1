@@ -34,7 +34,13 @@ param(
     # git fsck on the ~30 GB Chromium checkout is a 30-60+ minute solid-CPU walk
     # of every object. It is opt-in so the flag/ISA assertions below -- which are
     # the checks that actually catch our failure modes -- finish in seconds.
-    [switch]$DeepFsck
+    [switch]$DeepFsck,
+
+    # Tolerate a tree with the zen5 patches NOT applied. Only for inspecting a
+    # freshly synced checkout before the first configure; without this an
+    # unpatched tree is an ERROR, because this script's entire job is asserting
+    # that the CPU targeting is present.
+    [switch]$AllowUnpatched
 )
 
 $ErrorActionPreference = "Stop"
@@ -127,7 +133,20 @@ $patchesApplied = $false
 if (Test-Path $patchedFile) {
     $patchesApplied = (Select-String -Path $patchedFile -Pattern "thorium-zen5: Zen 5 CPU targeting" -Quiet)
     if (-not $patchesApplied) {
-        Add-Warn "zen5 marker not found in $patchedFile -- patches not applied yet (expected before the first 'build.ps1 configure -Profile zen5')."
+        $pmsg = "zen5 marker NOT FOUND in $patchedFile -- the CPU-targeting patches are not applied to this tree."
+        if ($AllowUnpatched) {
+            Add-Warn "$pmsg Tolerated because -AllowUnpatched was passed."
+        } else {
+            # This was a WARNING, and that let this whole script report success
+            # on a tree with no CPU targeting at all -- while the emitted-flag
+            # checks below happily read a toolchain.ninja left over from an
+            # earlier configure. Observed on 2026-09-18: a gclient sync from
+            # .17 to .44 reverted BUILD.gn, the marker was gone, and this
+            # script still exited 0. It is now an error, because the update
+            # pipeline gates on that exit code.
+            Add-Err ("$pmsg Run 'build.ps1 configure -Profile $Profile -Force' first, or pass " +
+                     "-AllowUnpatched to inspect an unpatched tree on purpose.")
+        }
     }
 } else {
     Add-Warn "$patchedFile not found -- source not synced yet."
@@ -226,6 +245,24 @@ $toolchainNinja = Join-Path $ninjaDir "toolchain.ninja"
 $result.emitted_flags = @{}
 if ((Test-Path $toolchainNinja) -and $Profile -eq "zen5") {
     $tn = Get-Content $toolchainNinja -Raw
+
+    # STALENESS GUARD. Every check below reads the GENERATED ninja. If that file
+    # predates the current BUILD.gn it was produced by an EARLIER configure, so
+    # the answers describe a tree that no longer exists -- and they will look
+    # perfect while the real source is unpatched. This is not hypothetical: on
+    # 2026-09-18 a sync reverted BUILD.gn at 08:57 while
+    # out/thorium-zen5/toolchain.ninja stayed behind from 11:51 the previous
+    # day, and all five flag assertions passed against the stale file.
+    $bgTime = (Get-Item $patchedFile -ErrorAction SilentlyContinue).LastWriteTimeUtc
+    $tnTime = (Get-Item $toolchainNinja).LastWriteTimeUtc
+    $result.toolchain_ninja_mtime_utc = $tnTime
+    $result.patched_buildgn_mtime_utc = $bgTime
+    if ($bgTime -and ($tnTime -lt $bgTime)) {
+        Add-Err ("STALE GENERATED BUILD FILES: $toolchainNinja ($tnTime UTC) is OLDER than " +
+                 "$patchedFile ($bgTime UTC), so it came from a previous configure and the " +
+                 "emitted-flag checks below describe a build that no longer matches the source. " +
+                 "Re-run 'build.ps1 configure -Profile $Profile -Force'.")
+    }
 
     $expectMarch = $flags["zen5_march"]
     $expectMtune = $flags["zen5_mtune"]
