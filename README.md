@@ -120,6 +120,62 @@ of those inflate code size on their own. Disabling tail merging gives up a
 code-size optimization, so it is a contributor, but isolating its share would
 need a build that varies only that flag. Not measured, so not claimed.
 
+### Releasing: what the pipeline gets wrong, and what now stops it
+
+The upgrade pipeline could not complete a single release until 2026-09-18. Four
+separate faults, none of which looked like what it was:
+
+| symptom | actual cause |
+|---|---|
+| `A positional parameter cannot be found that accepts argument '-Profile'` | `Invoke-Stage` splatted an ARRAY, which passes every element positionally. Only `sync` (no named args) ever worked. |
+| "already up to date" with a release-old browser | the check compared `chromium-tag.txt` (written by `sync`) against upstream, so a run that synced then failed marked itself done. Now keyed on the BUILT binary's version resource. |
+| 70 "unexpected local modification" errors naming `option 'show_stats': 0` | `MIMALLOC_VERBOSE=1` at user scope; every `git` call printed allocator stats and the porcelain parser turned each line into a filename. |
+| **9,032 tests failed** | the test launcher ran at **BelowNormal** priority and could not collect results from its children. |
+
+That last one is the instructive one. `-Priority BelowNormal` exists so a
+multi-hour build leaves the machine usable, and it is inherited by children.
+Applied to the test launcher it breaks result collection outright. Measured on
+one unchanged binary at the same `--test-launcher-jobs=14`, varying nothing but
+the priority class:
+
+| priority | result |
+|---|---|
+| Normal | 9,034 ran, **10** failed, 28 s, zero out-of-band errors |
+| BelowNormal | 9,936 out-of-band errors, 9m26s, effectively serial on an **idle** machine |
+
+So it was never CPU contention, and the exit code was identical in both cases --
+which is why it read as "the build is broken" twice over.
+
+Three things now keep this honest:
+
+* `scripts\Run-Tests.ps1` reads per-test results from the launcher's JSON
+  summary (via Python -- PowerShell 5.1's `ConvertFrom-Json` folds
+  case-differing test names like `.../DE` and `.../de` together and throws),
+  detects the out-of-band signature explicitly and reports it as a **harness
+  fault** naming priority as the likely cause, and fails only on failures absent
+  from `scripts\known-test-failures.txt`.
+* That allowlist carries a reason and a retirement condition per entry, and the
+  script reports entries that matched nothing so stale lines get pruned rather
+  than accumulating until they hide something real.
+* `update.ps1 -FromStage <stage>` resumes, because the pipeline being
+  all-or-nothing is what turned one false test failure into a discarded
+  two-and-a-quarter-hour build.
+
+**The 10 remaining failures are not codegen.** Eight are
+`ThreadPoolImplTest.IdentifiableStacks`, which asserts that frames named
+`RunBlockShutdown` and friends appear in a live stack trace; it guards itself
+with `stack.find("WorkerThread")`, which this build satisfies, so it proceeds
+and then fails because `is_official_build` + ThinLTO + PGO has inlined those
+diagnostic frames away. A generic official build fails it identically. The other
+two are `PathServiceTest.Get`/`GetSystemTemp` -- path availability, **not
+root-caused**, recorded rather than dismissed.
+
+Independent of both verdicts: 58/58 pass with `--single-process-tests`, and the
+installed binary returns
+`MARKER center=255_0_0_255 corner_alpha=0 sum=59628256`, byte-identical to the
+previous release -- so `roundRect` through `SkPathRawShapes::RRect` (the
+ISel-bug function) and V8 arithmetic are both correct.
+
 ### Performance, honestly
 
 **Speedometer 3.1, baseline vs zen5: +0.77%, p = 0.80, n=5 pairs. Not

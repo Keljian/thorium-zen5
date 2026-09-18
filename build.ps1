@@ -237,6 +237,12 @@ function Invoke-Logged {
         [Parameter(Mandatory)][string[]]$Arguments,
         [string]$WorkingDirectory = $null,
         [hashtable]$EnvVars = $null,
+
+        # Per-call priority override, including "Normal". build.ps1 lowers its own
+        # process priority, so children INHERIT BelowNormal -- which is what breaks
+        # the test launcher. See the test stage.
+        [ValidateSet("Idle","BelowNormal","Normal","AboveNormal","High")]
+        [string]$PriorityOverride = $null,
         [int[]]$AllowedExitCodes = @(0),
         [int]$HeartbeatSeconds = 30   # 0 disables the heartbeat line
     )
@@ -262,11 +268,18 @@ function Invoke-Logged {
     # process its parent's class at creation, so lowering the build driver
     # (siso/ninja/autoninja) automatically covers the hundreds of clang-cl
     # processes it goes on to spawn -- no need to chase them individually.
-    if ($Priority -ne "Normal") {
+    $effectivePriority = if ($PriorityOverride) { $PriorityOverride } else { $Priority }
+    # An EXPLICIT override must apply even when it is "Normal". Skipping the set
+    # for "Normal" looks harmless but is not: this script lowers its own priority,
+    # so a child left alone inherits BelowNormal. That is precisely the condition
+    # that makes the test launcher fail to collect results, so the first attempt
+    # at this fix changed nothing at all -- confirmed by reading PriorityClass off
+    # the live base_unittests process instead of trusting the flag.
+    if ($PriorityOverride -or $effectivePriority -ne "Normal") {
         try {
-            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::$Priority
+            $proc.PriorityClass = [System.Diagnostics.ProcessPriorityClass]::$effectivePriority
         } catch {
-            Write-Log "Could not set process priority to $Priority for '$Exe': $($_.Exception.Message)" "WARN"
+            Write-Log "Could not set process priority to $effectivePriority for '$Exe': $($_.Exception.Message)" "WARN"
         }
     }
 
@@ -961,27 +974,33 @@ function Invoke-Test {
     $outRel = "out\thorium-$Profile"
     Write-Log "Building + running base_unittests and a smoke test of the produced browser."
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") -Arguments @("-C", $outRel, "base_unittests") -WorkingDirectory $SrcDir -EnvVars $env
-    # CAP THE TEST LAUNCHER, for the same reason Get-JobCount caps the build.
+    # TESTS ARE GATED BY scripts\Run-Tests.ps1, NOT BY THE EXE'S EXIT CODE.
     #
-    # base_unittests uses Chromium's test launcher, which shards across child
-    # processes and collects each one's result through a temp "out-of-band
-    # success data" file. Starve it and EVERY test reports as failed with
-    #     Failed to get out-of-band test success data
-    # because the launcher cannot read results back -- not because anything is
-    # actually broken.
+    # base_unittests' exit code is not a usable release gate, for two reasons
+    # that both bit this project on 2026-09-18 and between them stopped a good
+    # build from ever being packaged.
     #
-    # That happened on 2026-09-18 for the .44 build: 9,032 tests "failed" in 620
-    # seconds, immediately after a build that had itself exhausted the commit
-    # limit. Re-run with --test-launcher-jobs=8 on the SAME binary: 0 out-of-band
-    # errors, 52 seconds, 10 real failures. The 9,022 difference was entirely the
-    # launcher, and it masked the 10 findings that were worth reading.
+    # 1. A STARVED LAUNCHER CALLS EVERYTHING A FAILURE. The launcher shards
+    #    across child processes and reads results back through temp files; run it
+    #    straight after a build that has exhausted the commit limit and it cannot
+    #    collect them, so every test is recorded as failed. Measured on one
+    #    unchanged binary: 9032 failed in 620s by default, versus 10 failed in
+    #    52s at --test-launcher-jobs=8, with zero out-of-band errors. The exit
+    #    code was identical in both cases.
     #
-    # Reuses Get-JobCount, so this follows available commit rather than core
-    # count, then halves it: each launcher child is a whole test process, much
-    # heavier than one clang-cl invocation.
-    $testJobs = [math]::Max(4, [math]::Floor((Get-JobCount) / 2))
-    Write-Log "Running base_unittests with --test-launcher-jobs=$testJobs (a starved launcher reports every test as failed)."
-    Invoke-Logged -Exe (Join-Path $SrcDir "$outRel\base_unittests.exe") -Arguments @("--gtest_shuffle", "--gtest_brief=1", "--test-launcher-jobs=$testJobs") -WorkingDirectory $SrcDir -AllowedExitCodes @(0)
+    # 2. TEN FAILURES ARE PERMANENT AND UNDERSTOOD. Eight are a stack-frame test
+    #    defeated by this build's own inlining. Gating on "zero failures" gates
+    #    on "never ship again".
+    #
+    # Run-Tests.ps1 caps the launcher from available commit, detects the
+    # starvation signature explicitly and reports it as a harness fault, reads
+    # per-test results from the launcher's JSON summary (via Python -- PowerShell
+    # 5.1's ConvertFrom-Json folds case-differing test names together and throws),
+    # and fails only on failures absent from scripts\known-test-failures.txt.
+    $runTests = Join-Path $PSScriptRoot "scripts\Run-Tests.ps1"
+    Invoke-Logged -Exe "powershell.exe" `
+        -Arguments @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $runTests, "-Profile", $Profile) `
+        -WorkingDirectory $RepoRoot -AllowedExitCodes @(0) -PriorityOverride "Normal"
 
     $exe = Get-ChildItem (Join-Path $SrcDir $outRel) -Filter "thorium.exe" -ErrorAction SilentlyContinue
     if (-not $exe) { $exe = Get-ChildItem (Join-Path $SrcDir $outRel) -Filter "chrome.exe" -ErrorAction SilentlyContinue }

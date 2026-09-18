@@ -34,6 +34,23 @@
     Skip the benchmark stage entirely. The benchmark is non-gating either way
     (see the stage comment); this just saves the time.
 
+.PARAMETER FromStage
+    Resume from this stage, skipping everything before it. The whole pipeline is
+    otherwise all-or-nothing, which on 2026-09-18 meant a false test failure
+    threw away a two-and-a-quarter-hour build: the binary was fine and sitting
+    right there, but there was no way to continue from `package`, so the only
+    documented route was to start again from `sync`.
+
+    Stage order:
+        sync configure verify build test analyze benchmark package installer publish
+
+    The stages are individually idempotent -- sync is a checkout to a pinned
+    tag, configure regenerates, build is incremental -- so resuming is safe;
+    what was missing was a way to express it. Use it when you know WHY an
+    earlier stage failed. It does not relax the gates: -FromStage build still
+    runs verify's successor gates, and skipping `verify` skips the check that
+    stops a silently-generic build shipping, so skip it only deliberately.
+
 .NOTES
     Exit codes:
         0   nothing to do, or the pipeline completed
@@ -43,6 +60,9 @@
             generated build files. Nothing is built from an unverified tree.
         10  -CheckOnly: a rebuild is needed
         11  another run (or a build in the same out dir) is already in progress
+
+    Resuming after a late failure, e.g. once tests are understood:
+        .\update.ps1 -Yes -FromStage package
 #>
 [CmdletBinding()]
 param(
@@ -51,7 +71,11 @@ param(
     [string]$Profile = "zen5",
     [switch]$Yes,
     [switch]$Install,
-    [switch]$SkipBenchmark
+    [switch]$SkipBenchmark,
+
+    [ValidateSet("sync", "configure", "verify", "build", "test", "analyze",
+                 "benchmark", "package", "installer", "publish")]
+    [string]$FromStage = "sync"
 )
 
 $ErrorActionPreference = "Stop"
@@ -352,16 +376,43 @@ function Invoke-Stage {
     }
 }
 
+# ---------------------------------------------------------------------------
+# Stage gating for -FromStage.
+#
+# Everything from here down asks Test-ShouldRunStage first. A skipped stage says
+# so in the log rather than vanishing, because a run that quietly did less than
+# the reader assumes is how this project has been bitten before.
+# ---------------------------------------------------------------------------
+$StageOrder = @("sync", "configure", "verify", "build", "test", "analyze",
+                "benchmark", "package", "installer", "publish")
+$script:FromIndex = [array]::IndexOf($StageOrder, $FromStage)
+
+function Test-ShouldRunStage([string]$Name) {
+    $i = [array]::IndexOf($StageOrder, $Name)
+    if ($i -lt 0) { return $true }          # unknown stage: never silently skip
+    if ($i -ge $script:FromIndex) { return $true }
+    Log "Skipping stage '$Name' (-FromStage $FromStage)."
+    return $false
+}
+
+if ($FromStage -ne "sync") {
+    Log "RESUMING from stage '$FromStage'. Stages before it are skipped -- make sure you know why the earlier ones can be trusted." "WARN"
+}
+
 # 4. fetch source (build.ps1 sync handles both Chromium and the Thorium meta-repo)
-Invoke-Stage -Name "sync" -Command "sync"
+if (Test-ShouldRunStage "sync") {
+    Invoke-Stage -Name "sync" -Command "sync"
+}
 
 # 5. rebase / reapply zen5 patches -- build.ps1 configure calls
 #    apply_zen5_patches.py, which exits 3 (and configure propagates the
 #    failure) if a marker is no longer found. We surface that distinctly.
-Invoke-Stage -Name "configure (reapplies zen5 patches; stops on patch conflict)" `
-    -Command "configure" -Params @{ Profile = $Profile; Force = $true } `
-    -FailMessage "PATCH CONFLICT or configure failure. Upstream Thorium's compiler-flag files may have changed shape. See patches/zen5/README.md 'Regenerating after upstream changes'. STOPPING -- no build will be attempted from an unpatched/half-patched tree." `
-    -FailExit 2
+if (Test-ShouldRunStage "configure") {
+    Invoke-Stage -Name "configure (reapplies zen5 patches; stops on patch conflict)" `
+        -Command "configure" -Params @{ Profile = $Profile; Force = $true } `
+        -FailMessage "PATCH CONFLICT or configure failure. Upstream Thorium's compiler-flag files may have changed shape. See patches/zen5/README.md 'Regenerating after upstream changes'. STOPPING -- no build will be attempted from an unpatched/half-patched tree." `
+        -FailExit 2
+}
 
 # 5b. ASSERT THE ZEN 5 TARGETING ACTUALLY SURVIVED THE UPGRADE.
 #
@@ -389,6 +440,7 @@ Invoke-Stage -Name "configure (reapplies zen5 patches; stops on patch conflict)"
 #     Invoke-Stage wraps, because powershell.exe is a NATIVE command. Do not
 #     "simplify" this to `& $verifyScript`; that reintroduces the bug
 #     documented in Invoke-Stage.
+if (Test-ShouldRunStage "verify") {
 Log "Stage: verify (asserts -march/-mtune/-Ctarget-cpu and the toolchain workarounds reached the generated build files)"
 $verifyScript = Join-Path $RepoRoot "verify-source.ps1"
 if (-not (Test-Path $verifyScript)) {
@@ -409,15 +461,22 @@ if ($LASTEXITCODE -ne 0) {
     exit 3
 }
 Log "verify OK -- the CPU targeting is present in the generated build files."
+}
 
 # 6. rebuild
-Invoke-Stage -Name "build" -Command "build" -Params @{ Profile = $Profile }
+if (Test-ShouldRunStage "build") {
+    Invoke-Stage -Name "build" -Command "build" -Params @{ Profile = $Profile }
+}
 
 # 7. test
-Invoke-Stage -Name "test" -Command "test" -Params @{ Profile = $Profile } -FailMessage "tests failed -- stopping pipeline (no release will be produced)."
+if (Test-ShouldRunStage "test") {
+    Invoke-Stage -Name "test" -Command "test" -Params @{ Profile = $Profile } -FailMessage "tests failed -- stopping pipeline (no release will be produced)."
+}
 
 # 8. ISA analysis
-Invoke-Stage -Name "analyze" -Command "analyze" -Params @{ Profile = $Profile } -FailMessage "ISA analysis failed -- stopping."
+if (Test-ShouldRunStage "analyze") {
+    Invoke-Stage -Name "analyze" -Command "analyze" -Params @{ Profile = $Profile } -FailMessage "ISA analysis failed -- stopping."
+}
 
 # 8b. Regression check against the previous successful build's ISA report
 $prevIsa = Join-Path $BuildDir "isa-report-$Profile.previous.json"
@@ -444,7 +503,9 @@ if (Test-Path $prevIsa) {
 # difference (+0.77%, p=0.80), and that test could only have resolved an effect
 # above ~8.4% anyway. Results are recorded when they work and skipped loudly
 # when they do not.
-if ($SkipBenchmark) {
+if (-not (Test-ShouldRunStage "benchmark")) {
+    # nothing: Test-ShouldRunStage already logged the skip
+} elseif ($SkipBenchmark) {
     Log "Stage: benchmark SKIPPED (-SkipBenchmark)."
 } else {
     Log "Stage: benchmark (non-gating -- a failure here will not stop the release)"
@@ -458,10 +519,14 @@ if ($SkipBenchmark) {
 }
 
 # 10. package only if everything above succeeded
-Invoke-Stage -Name "package" -Command "package" -Params @{ Profile = $Profile } -FailMessage "package failed -- stopping."
+if (Test-ShouldRunStage "package") {
+    Invoke-Stage -Name "package" -Command "package" -Params @{ Profile = $Profile } -FailMessage "package failed -- stopping."
+}
 
 # 11. installer -- only now, after full validation
-Invoke-Stage -Name "installer" -Command "installer" -Params @{ Profile = $Profile } -FailMessage "installer build failed -- stopping."
+if (Test-ShouldRunStage "installer") {
+    Invoke-Stage -Name "installer" -Command "installer" -Params @{ Profile = $Profile } -FailMessage "installer build failed -- stopping."
+}
 
 # 12. publish to GitHub Releases.
 #
@@ -469,8 +534,9 @@ Invoke-Stage -Name "installer" -Command "installer" -Params @{ Profile = $Profil
 # produced a good, installable build sitting in releases\; a GitHub outage or
 # an expired gh token is a reason to say so, not a reason to mark a two-hour
 # build as a failed pipeline. `build.ps1 publish` re-runs on its own.
-Log "Stage: publish"
 $published = $false
+if (Test-ShouldRunStage "publish") {
+Log "Stage: publish"
 try {
     & "$RepoRoot\build.ps1" publish -Profile $Profile
     $published = $true
@@ -478,8 +544,9 @@ try {
     Log ("publish failed -- the build itself is fine and is packaged under releases\. " +
          "Re-run '.\build.ps1 publish -Profile $Profile' once the cause is fixed. Detail: $_") "WARN"
 }
+}
 
-Copy-Item $curIsa $prevIsa -Force
+if (Test-Path $curIsa) { Copy-Item $curIsa $prevIsa -Force }
 Log "=== update.ps1 complete: release candidate produced for profile '$Profile' (published=$published) ==="
 
 # 12b. Optionally install it here, silently.
