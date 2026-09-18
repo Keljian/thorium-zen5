@@ -44,6 +44,24 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# ALLOCATOR DIAGNOSTICS ARE NOT DATA.
+#
+# depot_tools' git on this machine runs on mimalloc, and MIMALLOC_VERBOSE=1 was
+# set at USER scope -- so every `git` invocation printed ~70 lines of allocator
+# statistics ("option 'show_stats': 0", "reserved 1048576 KiB memory", ...).
+# Section 4 below parsed that stream into "unexpected local modification"
+# errors, failed a perfectly clean tree, and -- now that update.ps1 gates on
+# this script -- stopped the upgrade pipeline before the build. Observed
+# 2026-09-18 11:31.
+#
+# The real fix is the strict parsing in section 4; this is belt and braces,
+# silencing the noise at source for the child processes WE spawn. PROCESS scope
+# only -- the user's own environment is deliberately left alone.
+$env:MIMALLOC_VERBOSE     = '0'
+$env:MIMALLOC_SHOW_STATS  = '0'
+$env:MIMALLOC_SHOW_ERRORS = '0'
+
 $RepoRoot   = $PSScriptRoot
 $SrcDir     = Join-Path $RepoRoot "src"
 $BuildDir   = Join-Path $RepoRoot "build"
@@ -54,6 +72,23 @@ $warnings = New-Object System.Collections.Generic.List[string]
 
 function Add-Err([string]$m) { $errors.Add($m); Write-Host "ERROR: $m" -ForegroundColor Red }
 function Add-Warn([string]$m) { $warnings.Add($m); Write-Host "WARN: $m" -ForegroundColor Yellow }
+
+function Select-Sha1 {
+    <#
+    Pull the single 40-hex line out of possibly-noisy command output.
+
+    `git rev-parse HEAD` returns one sha, but Invoke-NativeCapture merges stderr
+    and the environment can inject unrelated lines (see the MIMALLOC note at the
+    top of this file). Taking .Trim() of the whole blob would have stored
+    allocator statistics as a commit revision.
+    #>
+    param([string]$Text)
+    foreach ($l in ($Text -split "`n")) {
+        $t = $l.Trim()
+        if ($t -match '^[0-9a-f]{40}$') { return $t }
+    }
+    return $null
+}
 
 function Invoke-NativeCapture {
     <#
@@ -96,7 +131,7 @@ if (-not (Test-Path (Join-Path $RepoRoot ".git"))) {
     $fsck = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $RepoRoot, "fsck", "--no-progress")
     if ($fsck.ExitCode -ne 0) { Add-Err "git fsck failed on $RepoRoot : $($fsck.Output)" }
     $rev = Invoke-NativeCapture -Exe "git" -Arguments @("-C", $RepoRoot, "rev-parse", "HEAD")
-    $result.source_revision = if ($rev.ExitCode -eq 0) { $rev.Output.Trim() } else { $null }
+    $result.source_revision = if ($rev.ExitCode -eq 0) { Select-Sha1 $rev.Output } else { $null }
 }
 
 if (Test-Path (Join-Path $SrcDir ".git")) {
@@ -104,7 +139,12 @@ if (Test-Path (Join-Path $SrcDir ".git")) {
     if ($srcRev.ExitCode -ne 0) {
         Add-Err "Chromium checkout at $SrcDir is not a readable git repository."
     } else {
-        $result.src_revision = $srcRev.Output.Trim()
+        $result.src_revision = Select-Sha1 $srcRev.Output
+        if (-not $result.src_revision) {
+            Add-Err ("git rev-parse HEAD on the Chromium checkout returned no recognisable commit sha. " +
+                     "Output was polluted -- check for MIMALLOC_VERBOSE / MIMALLOC_SHOW_STATS in the " +
+                     "environment, or a git hook writing to stdout.")
+        }
     }
 
     if ($DeepFsck) {
@@ -164,14 +204,43 @@ if (Test-Path (Join-Path $SrcDir ".git")) {
     if ($status.ExitCode -ne 0) {
         Add-Err "git status failed on the Chromium checkout: $($status.Output)"
     } else {
+        # STRICT porcelain parsing.
+        #
+        # `git status --porcelain` v1 emits exactly two status characters, a
+        # space, then the path. The old code did
+        #     $path = ($line -replace '^\S+\s+', '')
+        # against a 2>&1-merged stream, which turns ANY stray line into a
+        # filename. On 2026-09-18 that converted ~70 lines of mimalloc allocator
+        # statistics into "unexpected local modification" errors and failed a
+        # clean tree. Note the old .Trim() also destroyed the leading space that
+        # distinguishes " M" (worktree) from "M " (index), so paths were being
+        # matched against a mangled line anyway.
+        #
+        # Unparseable lines are now reported AS unparseable, which names the one
+        # real problem instead of inventing seventy fake ones.
+        $noise = New-Object System.Collections.Generic.List[string]
         foreach ($line in ($status.Output -split "`n")) {
-            $line = $line.Trim()
+            $line = $line.TrimEnd()
             if (-not $line) { continue }
-            # porcelain format: XY <path>
-            $path = ($line -replace '^\S+\s+', '')
-            if ($expectedModified -notcontains $path) {
-                $result.unexpected_changes += $path
+            if ($line -match '^([ MADRCU?!]{2}) (.+)$') {
+                $path = $Matches[2].Trim().Trim('"')
+                # Renames report "old -> new"; what exists now is the new path.
+                if ($path -match '^(.+?) -> (.+)$') { $path = $Matches[2].Trim().Trim('"') }
+                if ($expectedModified -notcontains $path) {
+                    $result.unexpected_changes += $path
+                }
+            } else {
+                $noise.Add($line)
             }
+        }
+        $result.git_status_noise_lines = $noise.Count
+        if ($noise.Count -gt 0) {
+            $sample = (($noise | Select-Object -First 3) -join ' | ')
+            Add-Err ("git status printed $($noise.Count) line(s) that are not porcelain output, so its " +
+                     "verdict cannot be trusted either way. This is almost always environment noise " +
+                     "leaking into the stream: check MIMALLOC_VERBOSE / MIMALLOC_SHOW_STATS (set at " +
+                     "user scope on this machine as of 2026-09-18) or a git hook writing to stdout. " +
+                     "First lines: $sample")
         }
         if ($result.unexpected_changes.Count -gt 0) {
             foreach ($c in $result.unexpected_changes) {

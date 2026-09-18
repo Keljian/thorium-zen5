@@ -45,6 +45,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# See the same block in verify-source.ps1. MIMALLOC_VERBOSE=1 at user scope made
+# every git call in this pipeline print ~70 lines of allocator statistics, which
+# the verify stage then parsed as source modifications. Silenced for OUR child
+# processes only; the user's environment is not modified.
+$env:MIMALLOC_VERBOSE     = '0'
+$env:MIMALLOC_SHOW_STATS  = '0'
+$env:MIMALLOC_SHOW_ERRORS = '0'
+
 $RepoRoot = $PSScriptRoot
 $SrcDir = Join-Path $RepoRoot "src"
 $BuildDir = Join-Path $RepoRoot "build"
@@ -443,32 +452,11 @@ Log "=== update.ps1 complete: release candidate produced for profile '$Profile' 
 #      file's version resource, as below.
 if ($Install) {
     Log "Stage: install (silent, user-level)"
-    $mini = Join-Path $SrcDir "out\thorium-$Profile\mini_installer.exe"
-    if (-not (Test-Path $mini)) {
-        Log "mini_installer.exe not found at $mini -- skipping install." "WARN"
-    } else {
-        $appDir = Join-Path $env:LOCALAPPDATA "Chromium\Application"
-        $running = @(Get-Process chrome -ErrorAction SilentlyContinue |
-                     Where-Object { $_.Path -and $_.Path.StartsWith($appDir, [StringComparison]::OrdinalIgnoreCase) })
-        if ($running.Count -gt 0) {
-            Log ("The installed Chromium is running ($($running.Count) processes). Not replacing a " +
-                 "browser in use -- close it and re-run '.\update.ps1 -Install', or install manually: " +
-                 "$mini --do-not-launch-chrome") "WARN"
-        } else {
-            try {
-                $proc = Start-Process -FilePath $mini -ArgumentList '--do-not-launch-chrome','--verbose-logging' `
-                            -PassThru -Wait -WindowStyle Hidden
-                $installed = Join-Path $appDir "chrome.exe"
-                if (Test-Path $installed) {
-                    $fv = (Get-Item $installed).VersionInfo.FileVersion
-                    Log "installed: $installed (version resource: $fv, installer exit $($proc.ExitCode))"
-                } else {
-                    Log "mini_installer exited $($proc.ExitCode) but $installed is absent -- install did not take." "WARN"
-                }
-            } catch {
-                Log "silent install failed (non-fatal; the packaged build is fine): $_" "WARN"
-            }
-        }
+    # One implementation of "install this build", shared with install.cmd.
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $RepoRoot "scripts\Install-Build.ps1") -Profile $Profile
+    if ($LASTEXITCODE -ne 0) {
+        Log "silent install did not complete (exit $LASTEXITCODE) -- the packaged build is fine; install it by hand." "WARN"
     }
 }
 
