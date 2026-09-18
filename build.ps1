@@ -961,7 +961,27 @@ function Invoke-Test {
     $outRel = "out\thorium-$Profile"
     Write-Log "Building + running base_unittests and a smoke test of the produced browser."
     Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") -Arguments @("-C", $outRel, "base_unittests") -WorkingDirectory $SrcDir -EnvVars $env
-    Invoke-Logged -Exe (Join-Path $SrcDir "$outRel\base_unittests.exe") -Arguments @("--gtest_shuffle", "--gtest_brief=1") -WorkingDirectory $SrcDir -AllowedExitCodes @(0)
+    # CAP THE TEST LAUNCHER, for the same reason Get-JobCount caps the build.
+    #
+    # base_unittests uses Chromium's test launcher, which shards across child
+    # processes and collects each one's result through a temp "out-of-band
+    # success data" file. Starve it and EVERY test reports as failed with
+    #     Failed to get out-of-band test success data
+    # because the launcher cannot read results back -- not because anything is
+    # actually broken.
+    #
+    # That happened on 2026-09-18 for the .44 build: 9,032 tests "failed" in 620
+    # seconds, immediately after a build that had itself exhausted the commit
+    # limit. Re-run with --test-launcher-jobs=8 on the SAME binary: 0 out-of-band
+    # errors, 52 seconds, 10 real failures. The 9,022 difference was entirely the
+    # launcher, and it masked the 10 findings that were worth reading.
+    #
+    # Reuses Get-JobCount, so this follows available commit rather than core
+    # count, then halves it: each launcher child is a whole test process, much
+    # heavier than one clang-cl invocation.
+    $testJobs = [math]::Max(4, [math]::Floor((Get-JobCount) / 2))
+    Write-Log "Running base_unittests with --test-launcher-jobs=$testJobs (a starved launcher reports every test as failed)."
+    Invoke-Logged -Exe (Join-Path $SrcDir "$outRel\base_unittests.exe") -Arguments @("--gtest_shuffle", "--gtest_brief=1", "--test-launcher-jobs=$testJobs") -WorkingDirectory $SrcDir -AllowedExitCodes @(0)
 
     $exe = Get-ChildItem (Join-Path $SrcDir $outRel) -Filter "thorium.exe" -ErrorAction SilentlyContinue
     if (-not $exe) { $exe = Get-ChildItem (Join-Path $SrcDir $outRel) -Filter "chrome.exe" -ErrorAction SilentlyContinue }
@@ -1295,10 +1315,15 @@ function Invoke-Publish {
     $releaseDir = Get-LatestReleaseDir
     if (-not $releaseDir) { throw "No packaged release for profile '$Profile' under $ReleasesDir. Run '.\build.ps1 package' first." }
 
+    # The install artifact is mini_installer.exe, copied here by Invoke-Package.
+    # A release without it is a set of reports about a build nobody can install,
+    # and publishing reports without the thing they describe is worse than not
+    # publishing. The Inno setup.exe is uploaded too when the optional installer
+    # stage produced one, but it is not required.
     $assets = Get-ChildItem $releaseDir.FullName -File
-    $setup = $assets | Where-Object { $_.Name -like "Thorium-Zen5-Setup-*" } | Select-Object -First 1
-    if (-not $setup) {
-        throw "$($releaseDir.FullName) has no Thorium-Zen5-Setup-*.exe. Run '.\build.ps1 installer -Profile $Profile' before publishing -- publishing reports without the thing they describe is worse than not publishing."
+    $mini = $assets | Where-Object { $_.Name -like "thorium_zen5_mini_installer_*" } | Select-Object -First 1
+    if (-not $mini) {
+        throw "$($releaseDir.FullName) has no thorium_zen5_mini_installer_*.exe. Run '.\build.ps1 package -Profile $Profile' first."
     }
 
     $ids = Get-BuildIdentity
@@ -1378,7 +1403,15 @@ function Invoke-All {
     Invoke-Analyze
     Invoke-Benchmark
     Invoke-Package
-    Invoke-Installer
+    # NO Invoke-Installer. mini_installer.exe is the install path: it installs to
+    # %LOCALAPPDATA%\Chromium\Application, which is where the browser actually
+    # lives on this machine. Invoke-Package already copies it into the release
+    # folder, so `all` has an installable artifact without the Inno stage.
+    #
+    # The Inno stage still exists and still works -- run `.\build.ps1 installer`
+    # for it -- but it builds a second, separately-branded install at a second
+    # location, and having two install paths half-wired is how the update checker
+    # ended up reading a registry key that nothing writes any more. One path.
     Invoke-Publish
     Write-Host "`n=== .\build.ps1 all complete for profile '$Profile' ===" -ForegroundColor Green
 }
