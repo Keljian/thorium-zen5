@@ -1,4 +1,4 @@
-﻿<#
+<#
 .SYNOPSIS
     Launches one build in isolation for benchmarking.
 
@@ -45,7 +45,12 @@ $ErrorActionPreference = 'Stop'
 $root         = 'C:\thorium'
 $outBase      = Join-Path $root 'src\out\thorium-baseline\chrome.exe'
 $outZen5      = Join-Path $root 'src\out\thorium-zen5\chrome.exe'
-$installedExe = Join-Path $env:USERPROFILE 'ThoriumZen5\Application\chrome.exe'
+# The canonical install. This pointed at %USERPROFILE%\ThoriumZen5\Application
+# (the Inno package) until 2026-09-18, when that install was removed: it had
+# drifted to a pre-Rust build while reporting the SAME version as the current
+# one, so -UseInstalled was silently benchmarking an older binary -- and after
+# the removal it pointed at a path that no longer exists at all.
+$installedExe = Join-Path $env:LOCALAPPDATA 'Chromium\Application\chrome.exe'
 $profileDir   = Join-Path $root "build\bench-profiles\$BuildProfile"
 
 $exe = switch ($BuildProfile) {
