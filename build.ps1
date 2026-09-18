@@ -535,7 +535,43 @@ function Get-UnknownGnArgs {
 
 function Get-JobCount {
     if ($Jobs -gt 0) { return $Jobs }
-    return (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+    $cpus = (Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors
+
+    # CAP BY AVAILABLE COMMIT, NOT JUST BY CORE COUNT.
+    #
+    # The 154.0.8037.44 build died at step 3029/66103 with
+    #     exit=-1073741523   (0xC0000017 STATUS_NO_MEMORY)
+    #     "Your system is low on virtual memory."
+    # Nothing was wrong with the build or the toolchain. On this 63.4 GB machine
+    # the commit LIMIT was 72.4 GB (63.4 GB RAM + a 9 GB pagefile), about 30 GB
+    # was already committed by everyday apps (browser, Edge WebViews, Evernote,
+    # a WSL VM), and 32 concurrent clang-cl / bindings-generator steps wanted
+    # more than the ~42 GB that left. The two steps that actually died were
+    # Python mojo/bindings generators, not compiles.
+    #
+    # Logical-processor count is the wrong budget for this: what runs out is
+    # commit, and the peak consumers are heavy Blink translation units and the
+    # generator actions rather than the average clang-cl. ~1.6 GB per job with
+    # 8 GB held back for the rest of the system keeps a full build inside the
+    # limit; raising the pagefile is what buys full parallelism back.
+    #
+    # Pass -Jobs explicitly to override this entirely.
+    $os = Get-CimInstance Win32_OperatingSystem
+    $availBytes = $os.FreeVirtualMemory * 1KB
+    $budgetGB = [math]::Floor($availBytes / 1GB) - 8
+    if ($budgetGB -lt 0) { $budgetGB = 0 }
+    $byCommit = [math]::Floor($budgetGB / 1.6)
+    if ($byCommit -lt 4) { $byCommit = 4 }   # never serialise the whole build
+
+    if ($byCommit -lt $cpus) {
+        Write-Log ("Using $byCommit parallel jobs instead of ${cpus}: only " +
+                   "$([math]::Round($availBytes/1GB,1)) GB of commit is available and a -j$cpus build " +
+                   "needs roughly $([math]::Round($cpus*1.6,0)) GB. Exceeding it fails with " +
+                   "STATUS_NO_MEMORY mid-build (see Get-JobCount). Close memory-heavy apps or raise " +
+                   "the pagefile for full parallelism, or pass -Jobs to override.") "WARN"
+        return [int]$byCommit
+    }
+    return $cpus
 }
 
 function Get-DepotToolsEnv {
