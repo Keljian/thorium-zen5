@@ -1,12 +1,7 @@
 @echo off
-REM Assert the Zen 5 targeting actually reached the generated build files:
-REM -march/-mtune on C++, -Ctarget-cpu on Rust, and both linker workarounds.
-REM Seconds, not minutes (git fsck is opt-in behind -DeepFsck).
+REM Check the Zen 5 targeting reached the generated build files. Seconds.
 setlocal
 cd /d "%~dp0"
-set MIMALLOC_VERBOSE=0
-set MIMALLOC_SHOW_STATS=0
-set MIMALLOC_SHOW_ERRORS=0
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0verify-source.ps1" -Profile zen5 %*
 set RC=%ERRORLEVEL%
 echo.

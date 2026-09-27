@@ -21,17 +21,15 @@
 # structure (via .gitkeep) but not contents.
 /build/*
 !/build/.gitkeep
-!/build/audit.json
-/build/logs/
-/build/current-overlay.txt
 
 # Packaged releases -- large binaries; distribute via GitHub Releases if
 # you want them off this machine, don't commit them to git history.
 /releases/*
 !/releases/.gitkeep
 
-# Local benchmark inputs (e.g. a cloned Speedometer checkout)
+# Local benchmark inputs and browser profiles made by the bench tools
 /benchmarks/speedometer/
+/benchmarks/prof-*/
 
 # Misc
 *.log
@@ -39,5 +37,6 @@
 *.exe
 *.dll
 *.7z
+__pycache__/
 Thumbs.db
 .vs/

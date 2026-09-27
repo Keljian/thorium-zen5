@@ -1,12 +1,7 @@
 @echo off
-REM Is a rebuild needed? Compares upstream stable against the version we
-REM actually BUILT (not what was last synced -- that distinction is why this
-REM pipeline once went quiet for a whole release). Exit 10 = rebuild needed.
+REM Is a rebuild needed? Exit 10 = yes, 0 = no. Changes nothing.
 setlocal
 cd /d "%~dp0"
-set MIMALLOC_VERBOSE=0
-set MIMALLOC_SHOW_STATS=0
-set MIMALLOC_SHOW_ERRORS=0
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0update.ps1" -Profile zen5 -CheckOnly %*
 set RC=%ERRORLEVEL%
 echo.

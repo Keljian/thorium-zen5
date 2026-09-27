@@ -11,6 +11,12 @@
 # has started PASSING is reported too, so stale lines get deleted rather than
 # accumulating -- an allowlist nobody prunes eventually hides a real failure.
 #
+# A leading '~' marks an entry INTERMITTENT: whether the test fails depends on
+# the environment, not on the build, so a passing run does not mean the line
+# can go. Intermittent entries are never reported as stale. Use it only when
+# the dependency has been demonstrated, not merely suspected -- otherwise it is
+# just a way of never pruning a line.
+#
 # Do NOT add an entry to make a red build green. Diagnose first; if the cause
 # is our codegen, fix the codegen.
 
@@ -48,3 +54,33 @@ All/ThreadPoolImplTest.IdentifiableStacks/*
 # Retire when: root-caused, or it starts passing.
 PathServiceTest.Get
 PathServiceTest.GetSystemTemp
+
+# ---------------------------------------------------------------------------
+# Upstream bug: GDI handle counting breaks for any process with a PID above
+# 65535. NOT a codegen, -march or Chromium-roll problem.
+#
+# base::debug::GetGDIHandleCountsInCurrentProcessForTesting() walks the GDI
+# shared handle table from the PEB and keeps entries where
+#     entry.wProcessId != pid        (gdi_debug_util_win.cc, CountHandleTypesFromTable)
+# is false. wProcessId is a 16-bit USHORT; pid is a 32-bit DWORD. Once the test
+# process's PID exceeds 65535 no entry can ever match, every count is zero, and
+# the test's "CreateDC added one DC" delta comes out 0.
+#
+# Demonstrated 2026-09-23 on one unchanged binary (154.0.8037.58, zen5), 24
+# single-process runs of this test alone:
+#     PID <= 65535   12 of 12 PASS
+#     PID >  65535   12 of 12 FAIL
+# base/debug/ had no source changes between 154.0.8037.44 (passed on 09-18)
+# and 154.0.8037.58 (failed on 09-23); the difference was which PID the test
+# process happened to get. PIDs run high straight after a build, because a
+# Chromium build spawns tens of thousands of short-lived processes, and that is
+# exactly when this stage runs.
+#
+# The same comparison sits under CollectGDIUsageAndDie, so upstream's GDI-leak
+# crash diagnostics under-report for high-PID processes too. Worth a crbug. The
+# obvious fix compares against the low 16 bits of the PID; what Windows actually
+# stores in that field for a PID above 65535 has NOT been verified here.
+#
+# Retire when: upstream fixes the comparison (check on each Chromium roll: the
+# test passes with a PID above 65535).
+~GdiDebugUtilWin.GdiHandleCountsCreateDC

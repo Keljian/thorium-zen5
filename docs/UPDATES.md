@@ -1,362 +1,173 @@
-# Keeping Thorium Zen5 up to date
+# Keeping the browser up to date
 
-## Just double-click one of these
+Two scheduled tasks do all of it. Nothing needs to be run by hand unless
+something fails, and failures raise a toast.
 
-Launchers in the repo root. No flags, no PowerShell, no remembering anything.
-Each one `cd`s to its own directory, silences mimalloc for its own window (see
-"Allocator noise" below), prints a pass/fail banner and pauses so the window does
-not vanish. Set `THORIUM_NOPAUSE=1` to suppress the pause for scripted use; extra
-arguments are forwarded to the underlying script.
-
-| file | what it does | time |
+| task | when | does |
 |---|---|---|
-| `check.cmd` | Is a rebuild needed? Exit 10 = yes | seconds |
-| `update.cmd` | The lot: sync, patch, **verify**, build, test, ISA report, package, installer, silent install | hours |
-| `sync.cmd` | Refresh the checkout only. **Reverts the Zen 5 patches** until you configure again | minutes |
-| `install.cmd` | Silently install the build already in `src\out\thorium-zen5` | seconds |
-| `verify.cmd` | Assert the targeting reached the compiler | seconds |
+| Thorium Zen5 - Build upstream updates | daily 03:00, 8 h limit | `update.ps1 -Yes`: rebuild if Chromium stable moved, publish, deploy |
+| Thorium Zen5 - Offer update | at logon, then hourly | `Check-ThoriumUpdate.ps1`: deploy |
 
-`update.cmd` runs with `-Yes -Install -SkipBenchmark`: no prompt, install the
-result, skip the non-gating benchmark.
+Register or refresh them with `scripts\Install-ThoriumTasks.ps1` (run it from
+a normal PowerShell window, not elevated).
 
-**Only one pipeline can run at a time.** `update.ps1` takes a named mutex and
-also refuses if a build driver is already working in the same output directory,
-exiting **11** either way. This is not theoretical: on 2026-09-18 a second run
-started 22 seconds into the first one's sync, both called `git fetch` on the same
-~30 GB checkout, and git failed the ref update with *"incorrect old value
-provided"*. Which run survives is a coin toss, and both write into the same
-`update.log` interleaved. Double-clicking `update.cmd` twice is all it takes.
+## Deploy
 
-## Manual
+"Deploy" compares the installed browser with the newest complete release
+under `releases\`:
 
-```powershell
-.\update.ps1                       # checks for updates, prompts, then runs the full pipeline
-.\update.ps1 -CheckOnly            # just checks; exit code 10 means a rebuild is needed
-.\update.ps1 -Profile zen5 -Yes    # non-interactive (for a scheduled task)
-.\update.ps1 -Yes -Install         # ...and silently install the result on this machine
-.\update.ps1 -Yes -SkipBenchmark   # skip the (non-gating) benchmark stage
-```
-
-Pipeline (`update.ps1`'s stages, each gated on the previous succeeding):
-
-```
-upstream update detected
-        v
-fetch source            (build.ps1 sync -- git checkout -f <tag>, gclient sync -D, runhooks)
-        v
-reapply zen5 patches    (build.ps1 configure -- apply_zen5_patches.py)
-        v
-configure               (gn gen)
-        v
-VERIFY TARGETING        (verify-source.ps1 -- hard stop; see below)
-        v
-build                   (build.ps1 build)
-        v
-test                    (build.ps1 test)
-        v
-ISA analysis            (build.ps1 analyze) + regression flag vs. previous build
-        v
-benchmark               (build.ps1 benchmark)  -- NON-GATING, see below
-        v
-package                 (build.ps1 package)
-        v
-installer               (build.ps1 installer)
-        v
-release candidate       (releases\thorium-zen5-<profile>-<sha>-<timestamp>\)
-```
-
-`update.ps1` **never** silently discards upstream changes, and never
-packages from a partially successful run: a failure at any stage exits
-non-zero immediately, before the next stage runs. Stage failure is
-detected by catching the exception `build.ps1` throws, not by reading
-`$LASTEXITCODE`, which after invoking a `.ps1` still holds whatever the
-last native process left behind and is therefore meaningless there.
-
-### The verify gate
-
-After `configure` and **before** the hours-long build, the pipeline runs
-`verify-source.ps1`, which asserts against the *generated ninja* that the CPU
-targeting actually reached the compiler:
-
-| check | asserts |
+| state | result |
 |---|---|
-| `cxx_march` / `cxx_mtune` | `-march=znver5 -mtune=znver5` on the C++ compile |
-| `rust_cpu` | `-Ctarget-cpu=znver5` on the Rust compile |
-| `tail_merge_workaround` | `-mllvm:-enable-tail-merge=false` on the chrome.dll link |
-| `slp_cap_workaround` | `-mllvm:-slp-max-reg-size=256` on the chrome.dll link |
+| installed is current | desktop icon reads **Update Chromium** |
+| newer release, Chromium closed | installed silently, toast says so |
+| newer release, Chromium open | desktop icon becomes **Install Chromium &lt;version&gt;**, one toast per build |
 
-A failure here is a **hard stop** (exit 3). The patches applying cleanly is not
-the same thing as the flags reaching the compiler, and the gap between those two
-is invisible in a green build -- it has produced two silent wrong builds on this
-project already (Rust at the generic baseline for the project's entire history;
-`-mtune=skylake-avx512` emitting zero 512-bit instructions). Shipping something
-labelled "Zen 5" that is silently generic is worse than not shipping.
+Nothing waits for a click and nothing closes the browser. Close Chromium and
+the next hourly check installs it, or double-click the desktop icon to do it
+now: the icon shows both versions, asks you to close Chromium if it is open,
+installs, reopens it, and waits for Enter.
 
-### Why the benchmark does not gate
+If an automatic install fails it is not retried for that build (no hourly
+toast storm); the desktop icon still offers it. Every install and every
+waiting build is logged in `build\logs\offer.log`.
 
-The benchmark stage records results when it works and is **skipped loudly** when
-it does not. It is deliberately not allowed to stop the pipeline: this pipeline
-exists to deliver Chromium **security** updates to one machine, the benchmark is
-its least reliable stage (it drives a real browser against a real network), and a
-flaky benchmark must never be why a security fix goes unpackaged. It is also not
-load-bearing for any decision -- see `docs/BENCHMARKS.md`, which records that the
-Zen 5 build shows no significant Speedometer difference anyway.
+Only releases are deployed. A release is written after build, tests and ISA
+analysis have all passed, so the raw build output in `src\out` (which can hold
+a build whose tests failed) is never installed from here. `install.cmd`
+installs `src\out` deliberately, for testing.
 
-### Installing the result
+### Newer means
 
-The pipeline's normal ending is to *offer* the update
-(`scripts\Check-ThoriumUpdate.ps1`), not to replace a browser you are using. Pass
-`-Install` to have it install silently instead, or do it by hand:
+- a higher Chromium version, or
+- the same version with a **different chrome.dll**. The manifest records
+  `chrome_dll_sha256`; the installed `chrome.dll` is hashed and compared. A
+  rebuild after a flag or toolchain change keeps the version number and
+  changes the binary, so it is offered. A byte-identical rebuild is not.
+
+Releases made before 2026-09-27 carry no hash, so for those an equal version
+counts as current.
+
+### What an install proves
+
+`scripts\Install-Build.ps1` runs `mini_installer.exe --do-not-launch-chrome`
+(user-level, into `%LOCALAPPDATA%\Chromium\Application`, keeping the existing
+profile) and then checks the result itself, because mini_installer's exit code
+is an installer status code rather than a success flag:
+
+- the installed version must equal the release's version (a refused
+  downgrade or a failed install is reported as a failure), and
+- the installed `chrome.dll` must hash identical to the release's, when the
+  release records a hash.
+
+It refuses to run while Chromium is open (exit 3) and holds a lock so the
+hourly task and the desktop icon cannot install at the same time. After a
+successful install it writes `initial_preferences` and adds
+`--no-default-browser-check` to the Chromium shortcuts, which stops the
+"make Chromium your default browser" prompt that mini_installer brings back.
+Windows does not let a script take the default browser association itself.
+
+## The nightly pipeline
+
+```
+sync       git checkout -f <stable tag>, gclient sync -D, runhooks
+configure  apply the zen5 patch, args.gn, gn gen
+verify     verify-source.ps1: the targeting reached the generated ninja (hard stop)
+build      chrome + mini_installer, build manifest
+test       base_unittests via Run-Tests.ps1, headless smoke test
+analyze    ISA report; warns if the AVX-512 count fell
+package    releases\thorium-zen5-<profile>-<chromium sha>-<time>\
+publish    GitHub Releases (non-fatal; retried next run)
+deploy     as above
+```
+
+A rebuild happens when any of these is true, and never otherwise:
+
+- upstream stable is newer than the **built** binary (`chrome.exe` version),
+- the checkout is ahead of the built binary (a run died after sync),
+- the built binary is newer than the newest **release** (a run compiled and
+  then failed a later stage),
+- there is no usable previous build.
+
+The synced tag alone is not the test: a run that fails after sync has
+already advanced it. The resolved stable version is the highest one
+chromiumdash reports for Windows, and sync refuses to move the checkout
+backwards.
+
+Every run, including a quiet one, also publishes the newest release if it
+was never published (`published.json` in the release folder marks success)
+and deploys.
+
+### Resuming
 
 ```powershell
-src\out\thorium-zen5\mini_installer.exe --do-not-launch-chrome --verbose-logging
+.\update.ps1 -Yes -FromStage package   # e.g. after a test failure is understood
+.\update.ps1 -Yes -Force               # rebuild the current tag from sync
+.\update.ps1 -CheckOnly                # exit 10 if a rebuild is needed
 ```
 
-That installs user-level into `%LOCALAPPDATA%\Chromium\Application`, adopts the
-existing profile in `%LOCALAPPDATA%\Chromium\User Data` in place, and registers in
-Add/Remove Programs. `-Install` refuses while the installed browser is running.
+Stages are idempotent. Skipping `verify` skips the check that stops a
+silently generic build, so skip it only on purpose.
 
-> On Windows, `chrome.exe --version` does **not** print and exit -- it ignores the
-> flag and launches the browser. Read the version from the file's version
-> resource instead.
+### Hangs and crashes
 
-## Two bugs that stopped this pipeline working at all
+`build\run-state.json` says `running` while a run is in progress. If the next
+run finds it still saying `running`, the previous run was killed (the 8-hour
+limit), crashed, or the machine restarted, and it says so in a toast. A
+stalled git transfer times out after five minutes rather than hanging the run.
+One pipeline runs at a time (a named mutex); a second exits 11, and a build
+already running in the same out directory outside the pipeline also exits 11,
+with a toast.
 
-Both were found on 2026-09-18 and are recorded here because each was invisible
-in normal operation, and the second is the exact failure this file's design was
-meant to prevent.
-
-**1. Named arguments never reached `build.ps1`.** `Invoke-Stage` built a
-`[string[]]` and splatted it: `& build.ps1 @StageArgs` with
-`@("configure", "-Profile", $Profile, "-Force")`. **Array splatting passes every
-element positionally**, so `-Profile` arrived as a positional *value* and
-`build.ps1` -- which has exactly one positional parameter -- failed with
-`A positional parameter cannot be found that accepts argument '-Profile'`.
-
-Only `sync`, the single stage passing no named parameters, ever worked. This
-pipeline had therefore **never completed an upgrade**. It looked healthy because
-every run before 2026-09-18 exited at the up-to-date check without reaching a
-stage; the first run with real work to do synced ~30 GB and died on the next
-line. Fixed by splatting a **hashtable**, which binds names correctly. Verified
-empirically, not reasoned about.
-
-**2. "Up to date" was measured against the wrong thing.** The check compared
-`build/chromium-tag.txt` -- written by the `sync` stage -- against chromiumdash.
-So when the run above synced successfully and *then* failed, the tag file had
-already advanced to the new version, and every later run concluded
-"already up to date, nothing to do" while the machine kept running the old
-build. The pipeline goes permanently quiet, and from outside that is
-indistinguishable from a quiet week upstream. That is the silent
-security-drift failure the `trap` at the top of `update.ps1` exists to catch,
-and the trap could not see it because nothing threw.
-
-Now the check keys on the **version resource of the binary we actually built**
-(`out\thorium-<profile>\chrome.exe`), which cannot drift from reality the way a
-marker file can. It also reports the installed version, and warns on a
-built-but-not-installed gap and on a checkout that has moved ahead of the last
-successful build (the fingerprint of a part-completed run).
-
-A related third hole, in `verify-source.ps1`: a missing patch marker was only a
-*warning*, and the emitted-flag checks read `toolchain.ninja` without checking
-its age. So the script exited 0 on a tree whose `BUILD.gn` a `gclient sync` had
-just reverted, because the flags were still present in a `toolchain.ninja` left
-over from the previous day's configure. Both are now errors -- an unpatched tree
-(unless `-AllowUnpatched`) and generated build files older than `BUILD.gn`.
-
-## What triggers "update available"
-
-Exactly two things:
-
-1. **A newer Chromium stable exists.** `scripts/ChromiumVersion.ps1` asks
-   chromiumdash for the last several Windows stable releases and takes the
-   **highest version**, then compares it to `build/chromium-tag.txt`, which
-   `build.ps1 sync` writes with the tag the checkout is pinned to. This is
-   a single cheap HTTP call; the ~30GB source is never fetched just to
-   poll.
-
-2. **No `build/build-manifest-<profile>.json` exists**, so a first run for
-   a profile does something useful instead of reporting "up to date".
-
-### Why "highest version" and not "most recent release"
-
-chromiumdash orders by release time, and Chrome ships several stable
-milestones concurrently. Observed 2026-09-16 with the checkout pinned at
-154.0.8037.17, the response led with 153.0.8010.48. Taking entry [0] would
-have resolved a stable that is a whole milestone **older** than what was
-already built.
-
-`Test-ChromiumVersionIsNewer` is the second half of that fix and is
-deliberately a separate function: the update is gated on strict version
-ordering, not on inequality, so even if resolution regresses again the
-pipeline cannot sync the checkout backwards and discard shipped security
-fixes. A resolution that comes back older is logged as a refused downgrade
-and treated as up to date.
-
-## Patch conflicts
-
-The only file this project patches is
-`src/build/config/compiler/BUILD.gn`. Sync discards the patched copy with
-`git checkout -f`, so there is no merge to conflict; the patch is
-re-synthesised from scratch at configure time.
-
-If `scripts/apply_zen5_patches.py` can no longer find one of its two
-anchors, or finds one more than once, it prints the anchor, writes
-nothing, and exits 3. `update.ps1` stops at the configure stage with a
-message pointing at `patches/zen5/README.md` "Regenerating after upstream
-changes". It does **not** guess a new insertion point and does not
-silently skip the targeting.
-
-Both anchors were last verified against Chromium trunk on 2026-09-14 and
-still matched exactly once.
-
-## Regressions
-
-After each ISA analysis, `update.ps1` compares the new
-`build/isa-report-<profile>.json` against
-`build/isa-report-<profile>.previous.json` (saved from the last
-*successful* full pipeline run) and flags, without auto-rejecting, a
-decrease in AVX-512 instruction count.
-
-Loss of PGO or LTO, or unexpected compiler-flag changes, show up directly
-in `build/build-manifest-<profile>.json`. Diff it against the previous
-release's copy under `releases\`. `verify-source.ps1` writes
-`build/source-verification.json` for the same purpose.
-
-Note that the test stage is currently `base_unittests` plus a headless
-`about:blank` smoke test. That is a thin gate for a build carrying
-codegen-altering toolchain workarounds; a miscompile from any of them
-would more likely surface in Blink or V8 than in base.
-
-## Publishing
-
-`build.ps1 publish` uploads the newest packaged release for a profile to
-GitHub Releases, tagged `v<chromium-version>-<profile>`. Release notes are
-generated from `build-manifest-<profile>.json` and the ISA report, so what is
-published always matches what was measured.
-
-The repo is **private**, and that is not incidental. This build sets
-`proprietary_codecs`, `ffmpeg_branding = "Chrome"` and `enable_widevine`, none
-of which are ours to redistribute. Publishing here is off-machine storage and
-version history for one person. Do not make the repo public without first
-stripping those from the published artifacts.
-
-`update.ps1` runs publish last and treats a failure there as a **warning, not
-a pipeline failure**. Everything before it produced a good installable build
-sitting in `releases\`; an expired `gh` token is a reason to say so, not a
-reason to mark a two-hour build as failed. Re-run `build.ps1 publish` on its
-own once the cause is fixed.
-
-## Versioning, and why it changed
-
-The installer used to take a 10-char commit sha as its version, which became
-`DisplayVersion` in Add/Remove Programs. That made the only question an
-updater has to answer -- "is the build I just made newer than the one
-installed?" -- unanswerable, because shas do not order.
-
-Now:
-
-- **Version** is the Chromium version, e.g. `154.0.8037.17`. Orderable.
-- **BuildId** is `<version>+<repo-sha10>+<utc-timestamp>`, so two builds of the
-  *same* Chromium version (a flag change, a toolchain roll) are still
-  distinguishable.
-
-Both are written by the installer to `HKCU\Software\ThoriumZen5`, and removed
-on uninstall, so a stale entry never outlives the install it describes.
-
-## Full automation
-
-```powershell
-.\scripts\Register-ThoriumUpdateNotifier.ps1    # once: AppUserModelID + URI handler, HKCU only
-.\scripts\Install-ThoriumTasks.ps1 -WhatIf      # look first
-.\scripts\Install-ThoriumTasks.ps1              # then register
-```
-
-Two scheduled tasks, both per-user:
-
-**"Thorium Zen5 - Build upstream updates"** runs `update.ps1 -Yes` daily at
-03:00. `update.ps1` self-gates, so on a day when nothing has shipped this
-costs one HTTP request. Runs whether or not you are logged on, at limited
-privilege: nothing in the pipeline needs admin, and an unattended multi-hour
-build is the last thing that should run elevated.
-
-**"Thorium Zen5 - Offer update"** runs `scripts\Check-ThoriumUpdate.ps1` at
-logon and every four hours, **in the interactive session** -- a toast raised
-from Session 0 is never displayed to anyone. It installs nothing on its own.
-It compares `HKCU\Software\ThoriumZen5` against the newest complete release
-under `releases\` and, if there is something newer, raises a toast whose
-"Install now" button runs the installer silently.
-
-The check is local, not a round trip through GitHub, because the machine that
-builds this browser and the machine that runs it are the same machine.
-`-Source GitHub` exists for the day a second machine wants the same build; it
-can only compare versions, not BuildIds, so same-version rebuilds are
-invisible over that path.
-
-### Why the toast needs registering
-
-Windows drops a toast raised by a process with no registered
-AppUserModelID, silently: no exception, nothing in Action Center. And toast
-buttons cannot run a command directly, because the toast usually outlives the
-process that raised it -- `activationType="protocol"` is the only route that
-survives that. `Register-ThoriumUpdateNotifier.ps1` creates both, under HKCU,
-no admin, and `-Unregister` removes them.
-
-Without it the checker still works and still tells you on the console; it just
-says so instead of pretending it showed you something.
-
-### Manual polling, if you would rather not have the tasks
-
-```
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File C:\thorium\update.ps1 -CheckOnly
-```
-
-Exit code `10` means an update is available. The `-CheckOnly` path never
-installs or publishes anything: nothing ships without completing the
-build/test pipeline first.
-
-## Exit codes
+### Exit codes
 
 | code | meaning |
 |---|---|
 | 0 | nothing to do, or the pipeline completed |
-| 1 | a stage failed -- see `build\logs\update.log` |
-| 2 | patch conflict: upstream moved the zen5 patch anchors |
-| 3 | **source verification failed** -- the CPU targeting did not reach the generated build files. Nothing is built from an unverified tree. |
+| 1 | a stage failed (`build\logs\update.log`) |
+| 2 | the zen5 patch no longer applies, or configure failed |
+| 3 | verify failed: the targeting did not reach the build files |
 | 10 | `-CheckOnly`: a rebuild is needed |
-| 11 | another run, or a build in the same out dir, is already in progress |
+| 11 | another run, or another build in the same out dir, is in progress |
 
-## Allocator noise, and why the scripts force it off
+## Patch conflicts
 
-`MIMALLOC_VERBOSE=1` is set at **user scope** on this machine (alongside
-`MIMALLOC_PURGE_DELAY=-1`, which is a legitimate git performance tweak).
-depot_tools' git runs on mimalloc, so with that variable set **every `git`
-invocation prints about seventy lines of allocator statistics**:
+The only file patched is `src/build/config/compiler/BUILD.gn`. Sync discards
+it with `git checkout -f` and configure re-applies the patch from scratch, so
+there is no merge to conflict. If `apply_zen5_patches.py` cannot find one of
+its two anchors exactly once, it writes nothing and exits 3, and the pipeline
+stops at configure (exit 2). See `patches/zen5/README.md` "Regenerating after
+upstream changes". The diff of each fresh application is saved under
+`build\patch-capture\` for comparison with the tracked reference diff.
 
-```
-v2.2.7 (built on Feb  2 2026, 17:39:08)
-option 'show_stats': 0
-reserved 1048576 KiB memory
-user: 0.968 s, system: 4.656 s, faults: 87588, peak rss: 266.7 MiB
-```
+## Clang rolls
 
-On 2026-09-18 `verify-source.ps1` parsed that into seventy "unexpected local
-modification" errors -- one per line of allocator output -- and failed a
-completely clean tree, stopping a security update before the build. The old
-parser did `$path = ($line -replace '^\S+\s+', '')` on a `2>&1`-merged capture,
-which turns *any* text into a filename.
+The two toolchain workarounds in `gn/win_zen5_args.gn` are pinned to a clang
+revision. When `tools/clang/scripts/update.py` rolls, the log says so and asks
+for a re-test with the `root_store_tool` canary. See `docs/TOOLCHAIN-BUGS.md`.
 
-Two defences, because either alone is fragile:
+## Publishing
 
-1. **Strict parsing.** `git status --porcelain` v1 is exactly two status
-   characters, a space, then the path. Anything else is collected and reported
-   *as unparseable output*, naming the one real problem instead of inventing
-   seventy fake ones. `git rev-parse` output is likewise filtered to an actual
-   40-hex sha, so noise can never be stored as a commit revision.
-2. **`MIMALLOC_VERBOSE`/`SHOW_STATS`/`SHOW_ERRORS` forced to `0`** at the top of
-   `update.ps1` and `verify-source.ps1`, and in each `.cmd`. **Process scope
-   only** -- your own environment is deliberately left alone.
+`build.ps1 publish` uploads the newest release, tagged
+`v<chromium-version>-<profile>` from that release's own manifest, with notes
+generated from the manifest and ISA report. The repository is private on
+purpose: `proprietary_codecs`, `ffmpeg_branding = "Chrome"` and
+`enable_widevine` are not ours to redistribute. Do not make it public without
+stripping those.
 
-If you want the noise gone everywhere else too (it will affect any other tool
-that parses git output), remove `MIMALLOC_VERBOSE` from your user environment
-variables and keep `MIMALLOC_PURGE_DELAY`. That is a change to your environment,
-so the scripts do not make it for you.
+`gh` must be logged in as you (`gh auth login`), in a normal shell.
+
+## Toasts
+
+A toast from an unpackaged script can display text but cannot carry a working
+button (Windows grants activation only to MSIX apps or COM activators), so
+toasts only report; the desktop icon is the action. The toast is attributed to
+a registered AppUserModelID (`ThoriumZen5.UpdateNotifier`), without which
+Windows shows it with no title or body.
+
+## Allocator noise
+
+`MIMALLOC_VERBOSE=1` is set at user scope on this machine, and git runs on
+mimalloc, so every git call prints allocator statistics. `scripts\Common.ps1`
+forces `MIMALLOC_VERBOSE`, `MIMALLOC_SHOW_STATS` and `MIMALLOC_SHOW_ERRORS` to 0
+for its own process and children; your environment is left alone. Removing
+`MIMALLOC_VERBOSE` from your user environment would silence it everywhere.

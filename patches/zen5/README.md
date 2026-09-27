@@ -2,8 +2,7 @@
 
 What this project adds to a **stock Chromium** checkout to target AMD Zen 5
 (Ryzen 9 9950X). Applied by `scripts/apply_zen5_patches.py`, which
-`build.ps1 configure` runs for the `zen5` and `generic-avx512` profiles (the
-`baseline` profile is left completely unpatched on purpose).
+`build.ps1 configure` runs for the `zen5` profile (not for `baseline`).
 
 ## Why there is anything to add at all
 
@@ -111,11 +110,14 @@ name the anchor that no longer matches. To fix:
 2. Find the equivalent location (the `config("compiler")` declaration, and its
    `cflags`/`ldflags`/`configs` initialiser block).
 3. Update `anchor1` / `anchor2` in `scripts/apply_zen5_patches.py`.
-4. Re-run `build.ps1 configure -Profile zen5 -Force` and confirm the captured
-   diff in this directory still shows only the two intended insertions.
+4. Re-run `build.ps1 configure -Profile zen5` and compare the captured diff
+   in `build\patch-capture\` with the reference copy here: it should still
+   show only the two intended insertions.
 
-The captured diff of the last successful application is committed here as
-`build_config_compiler_BUILD.gn.diff`.
+`build_config_compiler_BUILD.gn.diff` here is a reference copy from a
+known-good application. configure writes each fresh application's diff to
+`build\patch-capture\` (untracked) rather than rewriting this file on every
+Chromium roll; copy it here when the patch itself changes.
 
 ## Known comment drift in the patcher
 

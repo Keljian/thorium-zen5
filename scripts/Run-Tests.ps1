@@ -53,7 +53,7 @@
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet("baseline", "zen5", "generic-avx512")]
+    [ValidateSet("baseline", "zen5")]
     [string]$Profile = "zen5",
     [int]$Jobs = 0,
     [string]$Filter = $null
@@ -179,11 +179,25 @@ Write-Host ("  tests  : {0} ran, {1} failed" -f $ran, $failed.Count)
 # ---------------------------------------------------------------------------
 # Allowlist.
 # ---------------------------------------------------------------------------
-$patterns = @()
+# A leading '~' marks an entry INTERMITTENT: the test fails or passes depending
+# on the environment rather than on the build, so a run where it passes says
+# nothing about whether the line is still needed. Those entries still allow the
+# failure, but are never reported as stale -- telling someone to delete a line
+# on the run where the dice happened to come up the other way is how a known
+# failure turns back into a broken pipeline.
+$patterns     = @()
+$intermittent = @()
 if (Test-Path $Allowlist) {
-    $patterns = Get-Content $Allowlist |
-                ForEach-Object { ($_ -replace '#.*$', '').Trim() } |
-                Where-Object { $_ }
+    foreach ($raw in Get-Content $Allowlist) {
+        $entry = ($raw -replace '#.*$', '').Trim()
+        if (-not $entry) { continue }
+        if ($entry.StartsWith('~')) {
+            $entry = $entry.Substring(1).Trim()
+            if (-not $entry) { continue }
+            $intermittent += $entry
+        }
+        $patterns += $entry
+    }
 } else {
     Write-Host "  note: no allowlist at $Allowlist -- every failure will be treated as unexpected." -ForegroundColor Yellow
 }
@@ -200,6 +214,7 @@ $expected   = @($failed | Where-Object { Test-Allowed $_ })
 # renamed, or was not run. Say so, so the file gets pruned instead of growing.
 $stale = @()
 foreach ($p in $patterns) {
+    if ($intermittent -contains $p) { continue }
     if (-not ($failed | Where-Object { $_ -like $p })) { $stale += $p }
 }
 

@@ -2,7 +2,7 @@
 
 A personal Windows Chromium browser build, optimized for **AMD Ryzen 9
 9950X (Zen 5) / AVX-512**, with an automated
-source/update/build/test/package/installer pipeline. Built and run on a
+source/update/build/test/package/deploy pipeline. Built and run on a
 single machine (`rohansdesktopry`); backward CPU compatibility is
 explicitly not a goal.
 
@@ -15,24 +15,26 @@ that part is ours. **It now builds stock Chromium plus one local patch.**
 See `docs/ARCHITECTURE.md`.
 
 ```powershell
-.\build.ps1 all          # audit -> sync -> configure -> build -> test -> analyze -> benchmark -> package -> installer
-.\update.ps1             # check for a newer Chromium stable and re-run the pipeline
+.\update.ps1 -Yes        # rebuild if Chromium stable moved, publish, deploy (what the 03:00 task runs)
+.\build.ps1 <stage>      # one stage: sync, configure, build, test, analyze, package, publish
 ```
+
+Day to day there is nothing to run: a new build installs itself when
+Chromium is closed, or the desktop icon turns into "Install Chromium
+<version>" while it is open. See `docs/UPDATES.md`.
 
 ## Start here
 
 - **`docs/BUILD.md`** -- prerequisites and the full build walkthrough.
 - **`docs/ARCHITECTURE.md`** -- repo layout, how the tree is patched, and
   what is deliberately left as runtime CPU dispatch.
-- **`docs/UPDATES.md`** -- the automated update pipeline, the downgrade
-  guard, and how patch conflicts are handled.
+- **`docs/UPDATES.md`** -- the nightly pipeline, deploy, and how patch
+  conflicts are handled.
+- **`docs/HISTORY.md`** -- every failure that shaped the scripts, and what
+  now prevents it.
 - **`docs/TOOLCHAIN-BUGS.md`** -- the three LLVM bugs this build works
   around, with the isolation matrices.
 - **`docs/BENCHMARKS.md`** -- where measured results get recorded.
-- **`build/audit.json`** -- machine-readable audit of the checkout: clang
-  revision, whether it recognises `-march=znver5`, which files this
-  project modifies, and a runtime-dispatch survey of the SIMD-heavy
-  third-party libraries.
 - **`patches/zen5/README.md`** -- what each edit does, why, and how to
   re-anchor it against a new Chromium revision.
 
@@ -56,8 +58,8 @@ comparison point.
 
 ## Status
 
-Built, verified, measured, packaged and installed against Chromium
-154.0.8037.17.
+The measurements below were taken on Chromium 154.0.8037.17. The installed
+build tracks Chromium stable (155.0.8059.12 as of 2026-09-27).
 
 ### The targeting is verified, not assumed
 
@@ -120,46 +122,13 @@ of those inflate code size on their own. Disabling tail merging gives up a
 code-size optimization, so it is a contributor, but isolating its share would
 need a build that varies only that flag. Not measured, so not claimed.
 
-### Releasing: what the pipeline gets wrong, and what now stops it
+### Tests
 
-The upgrade pipeline could not complete a single release until 2026-09-18. Four
-separate faults, none of which looked like what it was:
-
-| symptom | actual cause |
-|---|---|
-| `A positional parameter cannot be found that accepts argument '-Profile'` | `Invoke-Stage` splatted an ARRAY, which passes every element positionally. Only `sync` (no named args) ever worked. |
-| "already up to date" with a release-old browser | the check compared `chromium-tag.txt` (written by `sync`) against upstream, so a run that synced then failed marked itself done. Now keyed on the BUILT binary's version resource. |
-| 70 "unexpected local modification" errors naming `option 'show_stats': 0` | `MIMALLOC_VERBOSE=1` at user scope; every `git` call printed allocator stats and the porcelain parser turned each line into a filename. |
-| **9,032 tests failed** | the test launcher ran at **BelowNormal** priority and could not collect results from its children. |
-
-That last one is the instructive one. `-Priority BelowNormal` exists so a
-multi-hour build leaves the machine usable, and it is inherited by children.
-Applied to the test launcher it breaks result collection outright. Measured on
-one unchanged binary at the same `--test-launcher-jobs=14`, varying nothing but
-the priority class:
-
-| priority | result |
-|---|---|
-| Normal | 9,034 ran, **10** failed, 28 s, zero out-of-band errors |
-| BelowNormal | 9,936 out-of-band errors, 9m26s, effectively serial on an **idle** machine |
-
-So it was never CPU contention, and the exit code was identical in both cases --
-which is why it read as "the build is broken" twice over.
-
-Three things now keep this honest:
-
-* `scripts\Run-Tests.ps1` reads per-test results from the launcher's JSON
-  summary (via Python -- PowerShell 5.1's `ConvertFrom-Json` folds
-  case-differing test names like `.../DE` and `.../de` together and throws),
-  detects the out-of-band signature explicitly and reports it as a **harness
-  fault** naming priority as the likely cause, and fails only on failures absent
-  from `scripts\known-test-failures.txt`.
-* That allowlist carries a reason and a retirement condition per entry, and the
-  script reports entries that matched nothing so stale lines get pruned rather
-  than accumulating until they hide something real.
-* `update.ps1 -FromStage <stage>` resumes, because the pipeline being
-  all-or-nothing is what turned one false test failure into a discarded
-  two-and-a-quarter-hour build.
+`scripts\Run-Tests.ps1` gates on base_unittests' per-test JSON results and
+fails only on failures absent from `scripts\known-test-failures.txt`, which
+carries a reason and a retirement condition per entry. How the exit code
+alone once reported 9,032 failures for a build with 10 is in
+`docs/HISTORY.md`.
 
 **The 10 remaining failures are not codegen.** Eight are
 `ThreadPoolImplTest.IdentifiableStacks`, which asserts that frames named
@@ -178,23 +147,17 @@ ISel-bug function) and V8 arithmetic are both correct.
 
 ### Performance, honestly
 
-**Speedometer 3.1, baseline vs zen5: +0.77%, p = 0.80, n=5 pairs. Not
-significant.** Measured 2026-09-18 by `scripts/run_bench_suite.py`, ten
-unattended runs with alternating order, each run recording the SHA256 of the
-binary it drove. This replaces the 2026-09-16 result, which could not rule out
-having measured the same binary twice.
+**Speedometer 3.1, baseline vs zen5: no significant difference.** The
+latest alternating-order comparison is +1.3%, p = 0.52; the earlier
+controlled run was +0.77%, p = 0.80, and could only have resolved an effect
+above about 8.4%. Scores drift more than that across a session on machine
+state alone. Details in `docs/BENCHMARKS.md`.
 
-The limit matters as much as the number: pooled SD was 1.97 points on a mean of
-41.5, so **this test could only have detected an effect larger than about
-8.4%**. It does not show the Zen 5 build is no faster; it shows any difference
-is below what five pairs can resolve. Scores drifted 5.2 points (12.5%) across
-the session on machine state alone -- twelve times the effect being sought.
-
-**MotionMark: 2935.64 (+/-2.01%) zen5 vs 1305.84 (+/-31.57%) baseline.
-Recorded, not believed.** A 2.2x on a graphics benchmark is not a plausible
-consequence of instruction selection, and the baseline run's +/-31.57%
-variance says that run was unstable rather than slow. It predates the
-controlled harness and should be re-run under it.
+**MotionMark: unresolved.** zen5 scored 2935; the baseline scores about
+1270-1340 when run in isolation. A 2.2x on a graphics benchmark is not a
+plausible consequence of instruction selection, and the two were not run
+the same way (the zen5 number was never repeated from its own out
+directory under the same harness), so it is recorded, not believed.
 
 So: the codegen change is real and verified; a user-visible speedup is not
 established, and Speedometer is the wrong place to look for one. V8 emits its
@@ -204,21 +167,10 @@ raster, media and image decode, and the Rust crates. See `docs/BENCHMARKS.md`.
 
 ### Installed
 
-A silent, user-level install of the shipped build sits at
-`%LOCALAPPDATA%\Chromium\Application\154.0.8037.17`, registered as "Chromium"
-in Add/Remove Programs. Its `chrome.dll` hashes identical to
-`out\thorium-zen5\chrome.dll`. The existing profile under
-`%LOCALAPPDATA%\Chromium\User Data` is adopted in place and was not modified.
-
-Reinstall after any rebuild with:
-
-```
-out\thorium-zen5\mini_installer.exe --do-not-launch-chrome --verbose-logging
-```
-
-Note that on Windows `chrome.exe --version` does not print and exit -- it
-ignores the flag and launches the browser. Read the version from the file's
-version resource instead.
+`%LOCALAPPDATA%\Chromium\Application`, installed by mini_installer and
+registered as "Chromium" in Add/Remove Programs, with the existing profile
+under `%LOCALAPPDATA%\Chromium\User Data` kept in place. Deploy verifies
+every install (version, and chrome.dll hash where the release records one).
 
 ### Open items, stated rather than skipped
 
@@ -240,7 +192,3 @@ version resource instead.
   `Get-ChildItem`/`.Length` are logical sizes, so actual disk usage -- and
   anything reclaimed by deleting build output -- is about half what they say.
   The binary sizes above are file sizes and are unaffected.
-- `verify-source.ps1` now skips `git fsck` on the Chromium checkout by
-  default; it cost 30-60+ minutes of solid CPU and starved the checks that
-  actually catch regressions. Pass `-DeepFsck` when you specifically suspect
-  checkout corruption.

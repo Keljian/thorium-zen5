@@ -1,288 +1,190 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Is there a newer Thorium Zen5 build than the one installed? If so, offer it.
+    Deploy the newest packaged build: install it if the browser is closed,
+    otherwise flag it on the desktop.
 
 .DESCRIPTION
-    The machine that builds this browser and the machine that runs it are the
-    same machine, so "is there an update" is a local question: compare what the
-    installer wrote to HKCU against the newest packaged release under releases\.
-    Going out to the GitHub API to ask about a file this computer produced
-    itself would add a network dependency and an auth dependency to a question
-    that can be answered from disk. -Source GitHub is there for the day a second
-    machine wants the same build.
+    Compares the installed browser with the newest complete release under
+    releases\ (see Get-NewestRelease and Test-ReleaseIsNewer in Common.ps1).
+    Releases are only written after build, tests and ISA analysis pass, so the
+    raw build output in src\out is never deployed from here.
 
-    Comparison is two-stage, because a version number alone cannot answer it:
+    Default (the scheduled task, and the end of update.ps1):
+      * up to date         -> the desktop icon reads "Update Chromium"
+      * newer, browser shut -> install silently, toast the result
+      * newer, browser open -> the desktop icon becomes
+                              "Install Chromium <version>", and one toast per
+                              build says so. The next check with the browser
+                              closed installs it.
+    Nothing waits and nothing closes the browser.
 
-      1. Chromium version, ordered. 154.0.8040.3 beats 154.0.8037.17.
-      2. If the versions are equal, BuildId. A rebuild of the same Chromium
-         version after a flag or toolchain change is a different build and
-         should be offerable, and its BuildId differs even though its version
-         does not.
+    A failed automatic install is not retried for the same build; the desktop
+    icon still offers it, and build\logs\offer.log has the installer output.
 
-    Nothing is installed without a click. -Install is what the toast's button
-    (and only the toast's button) invokes.
-
-.PARAMETER Profile
-    Which profile's releases to look at. Default: zen5.
-
-.PARAMETER Source
-    Local (default) reads releases\. GitHub queries `gh release list`.
+.PARAMETER Interactive
+    The desktop icon. Shows both versions, asks you to close the browser if it
+    is open, installs, reopens the browser, and waits for Enter.
 
 .PARAMETER Install
-    Skip the check UI and install the newest available build silently. This is
-    what the notification's click handler calls, and it is also the way to
-    install from a terminal without waiting for a notification.
+    Install the newest release now if it is newer (with -Force, even if not).
 
 .PARAMETER Quiet
-    No console output and no toast. Sets the exit code only, for a scheduled
-    task that wants to decide for itself.
+    Change nothing. Exit 10 if an update is available, 0 if not.
 
-.OUTPUTS
-    Exit 0  up to date (or install completed)
-    Exit 10 an update is available
-    Exit 1  something went wrong
-
-.EXAMPLE
-    .\Check-ThoriumUpdate.ps1
-    .\Check-ThoriumUpdate.ps1 -Quiet; if ($LASTEXITCODE -eq 10) { ... }
+.NOTES
+    Exit codes: 0 up to date or installed | 10 update waiting | 1 failed
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet("baseline", "zen5", "generic-avx512")]
+    [ValidateSet("baseline", "zen5")]
     [string]$Profile = "zen5",
-
-    [ValidateSet("Local", "GitHub")]
-    [string]$Source = "Local",
-
+    [switch]$Interactive,
     [switch]$Install,
-    [switch]$Quiet,
-
-    # Raise the notification even when the installed build is already current.
-    #
-    # Without this there is no way to exercise the notification path on demand:
-    # it only fires when a newer build exists, so the only way to see it was to
-    # wait for Chromium to ship a release. Clicking through with -Force
-    # reinstalls the same version, which Inno handles as an in-place upgrade,
-    # so this tests the real path rather than a mock of it.
     [switch]$Force,
-
-    # How long to leave the notification up waiting for a click. The scheduled
-    # task that runs this has its own 10-minute execution limit, so keep this
-    # comfortably under it.
-    [int]$TimeoutMinutes = 5
+    [switch]$Quiet
 )
 
 $ErrorActionPreference = "Stop"
-$RepoRoot    = Split-Path -Parent $PSScriptRoot
-$ReleasesDir = Join-Path $RepoRoot "releases"
-$RegKey      = "HKCU:\Software\ThoriumZen5"
+. (Join-Path $PSScriptRoot "Common.ps1")
 
-# Toast + tray notification, shared with update.ps1. Duplicating it across
-# both scripts is how this project once shipped the same version-resolution
-# bug twice over; see scripts/ChromiumVersion.ps1.
-. (Join-Path $PSScriptRoot "ThoriumNotify.ps1")
+$OfferLog   = Join-Path $ThoriumLogs "offer.log"
+$StateFile  = Join-Path $ThoriumBuild "deploy-state-$Profile.json"
+$InstallPs1 = Join-Path $PSScriptRoot "Install-Build.ps1"
 
-function Say([string]$m) { if (-not $Quiet) { Write-Host $m } }
+function Log([string]$m) { $null = Add-LogLine -Path $OfferLog -Message $m }
 
-# ---------------------------------------------------------------------------
-# What is installed
-# ---------------------------------------------------------------------------
-function Get-InstalledBuild {
-    <#
-    Returns $null when nothing is installed, which is a normal state and not an
-    error: the first run of this script on a machine that has only ever run the
-    browser out of src\out\ has nothing to compare against, and the right
-    answer there is "here is a build you could install", not a failure.
-    #>
-    if (-not (Test-Path $RegKey)) { return $null }
-    $p = Get-ItemProperty $RegKey -ErrorAction SilentlyContinue
-    if (-not $p -or -not $p.Version) { return $null }
-    return @{
-        Version     = [string]$p.Version
-        BuildId     = [string]$p.BuildId
-        Profile     = [string]$p.Profile
-        InstallPath = [string]$p.InstallPath
+function Get-State {
+    $s = try { Get-Content $StateFile -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+    if (-not $s) { $s = [PSCustomObject]@{ Notified = ""; Failed = "" } }
+    return $s
+}
+function Save-State($s) { try { $s | ConvertTo-Json | Set-Content -Path $StateFile -Encoding ASCII } catch { } }
+
+function Invoke-Install($Release) {
+    # Returns the Install-Build exit code; its output goes to the console
+    # when interactive and to offer.log otherwise.
+    if ($Interactive) {
+        & $InstallPs1 -Profile $Profile -Installer $Release.Installer
+        return $LASTEXITCODE
     }
+    $out = & $InstallPs1 -Profile $Profile -Installer $Release.Installer *>&1 | Out-String
+    $code = $LASTEXITCODE
+    foreach ($l in ($out -split "`r?`n" | Where-Object { $_.Trim() })) { Log "  $l" }
+    return $code
 }
 
-# ---------------------------------------------------------------------------
-# What is available
-# ---------------------------------------------------------------------------
-function Get-AvailableBuild {
-    if ($Source -eq "GitHub") { return Get-AvailableBuildFromGitHub }
-    return Get-AvailableBuildFromDisk
-}
+function Get-VersionText($b) { if ($b) { $b.Version } else { "nothing" } }
 
-function Get-AvailableBuildFromDisk {
-    $dirs = Get-ChildItem $ReleasesDir -Directory -Filter "thorium-zen5-$Profile-*" -ErrorAction SilentlyContinue
-    $best = $null
-    foreach ($d in $dirs) {
-        $setup = Get-ChildItem $d.FullName -Filter "Thorium-Zen5-Setup-*.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
-        $mf    = Join-Path $d.FullName "build-manifest-$Profile.json"
-        # A release folder without both is a half-finished package (installer
-        # stage never ran, or the run died between stages). Skip it rather than
-        # offering an update that cannot be installed.
-        if (-not $setup -or -not (Test-Path $mf)) { continue }
-
-        $m = Get-Content $mf -Raw | ConvertFrom-Json
-        $version = $m.source_revisions.chromium_tag
-        if (-not $version -or $version -notmatch '^\d+\.\d+\.\d+\.\d+$') { continue }
-
-        $repoSha = $m.source_revisions.thorium_zen5_repo_commit
-        $short   = if ($repoSha) { $repoSha.Substring(0, [Math]::Min(10, $repoSha.Length)) } else { "nosha" }
-        $stamp   = try { ([datetime]$m.generated_at_utc).ToUniversalTime().ToString("yyyyMMddHHmmss") } catch { "00000000000000" }
-
-        $cand = @{
-            Version   = $version
-            BuildId   = "$version+$short+$stamp"
-            Installer = $setup.FullName
-            Stamp     = $stamp
-            Dir       = $d.FullName
-        }
-        # Newest wins: version first, then build timestamp, so a rebuild of the
-        # same Chromium version still sorts after the one it replaces.
-        if (-not $best -or
-            ([version]$cand.Version -gt [version]$best.Version) -or
-            ([version]$cand.Version -eq [version]$best.Version -and $cand.Stamp -gt $best.Stamp)) {
-            $best = $cand
-        }
-    }
-    return $best
-}
-
-function Get-RepoSlug {
-    <#
-    owner/name for gh, resolved from the git remote rather than hardcoded or
-    inferred from the current directory. A scheduled task does not run with its
-    cwd inside the repo, and gh with no --repo would then talk to whatever
-    repository the cwd happens to belong to, or to none.
-    #>
-    $url = & git -C $RepoRoot remote get-url origin 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $url) { throw "Could not read the 'origin' remote from $RepoRoot." }
-    if ($url -notmatch '[:/]([^/:]+)/([^/]+?)(\.git)?\s*$') { throw "Unrecognized remote URL: $url" }
-    return "$($Matches[1])/$($Matches[2])"
-}
-
-function Get-AvailableBuildFromGitHub {
-    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-        throw "-Source GitHub needs the GitHub CLI (gh) on PATH and an authenticated account."
-    }
-    $slug = Get-RepoSlug
-    $json = & gh release list --repo $slug --limit 30 --json tagName,createdAt 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $json) { throw "gh release list failed for $slug. Check 'gh auth status'." }
-
-    $best = $null
-    foreach ($r in ($json | ConvertFrom-Json)) {
-        # Tags are v<version>-<profile>, written by build.ps1 publish.
-        if ($r.tagName -notmatch "^v(\d+\.\d+\.\d+\.\d+)-$([regex]::Escape($Profile))$") { continue }
-        $version = $Matches[1]
-        $cand = @{
-            Version   = $version
-            BuildId   = $null          # not carried in the tag; see the note below
-            Installer = $null          # downloaded on demand by Install-Build
-            Stamp     = ([datetime]$r.createdAt).ToUniversalTime().ToString("yyyyMMddHHmmss")
-            Tag       = $r.tagName
-        }
-        if (-not $best -or [version]$cand.Version -gt [version]$best.Version) { $best = $cand }
-    }
-    # Honest limitation: a GitHub-sourced check can only compare versions, not
-    # BuildIds, because the tag does not carry one (two builds of the same
-    # Chromium version would collide on the same tag and the second is uploaded
-    # with --clobber). Same-version rebuilds are therefore invisible over this
-    # path. The local path does not have this problem, which is the other reason
-    # it is the default.
-    return $best
-}
-
-# ---------------------------------------------------------------------------
-# Compare
-# ---------------------------------------------------------------------------
-function Test-IsNewer($Available, $Installed) {
-    if (-not $Available) { return $false }
-    if (-not $Installed) { return $true }
-    $a = [version]$Available.Version
-    $i = [version]$Installed.Version
-    if ($a -gt $i) { return $true }
-    if ($a -lt $i) { return $false }
-    # Same Chromium version. Different build is still an update; unknown
-    # BuildId (the GitHub path) is deliberately treated as NOT newer, so an
-    # ambiguous answer never nags.
-    if (-not $Available.BuildId) { return $false }
-    return ($Available.BuildId -ne $Installed.BuildId)
-}
-
-# ---------------------------------------------------------------------------
-# Install
-# ---------------------------------------------------------------------------
-function Install-Build($Available, $Installed) {
-    if (-not $Available) { throw "Nothing available to install." }
-
-    $installer = $Available.Installer
-    if (-not $installer -and $Available.Tag) {
-        $tmp = Join-Path $env:TEMP "thorium-zen5-$($Available.Tag)"
-        New-Item -ItemType Directory -Force -Path $tmp | Out-Null
-        Say "Downloading $($Available.Tag) from GitHub..."
-        & gh release download $Available.Tag --repo (Get-RepoSlug) --pattern "Thorium-Zen5-Setup-*.exe" --dir $tmp --clobber
-        if ($LASTEXITCODE -ne 0) { throw "gh release download failed for $($Available.Tag)." }
-        $installer = (Get-ChildItem $tmp -Filter "Thorium-Zen5-Setup-*.exe" | Select-Object -First 1).FullName
-    }
-    if (-not $installer -or -not (Test-Path $installer)) { throw "Installer not found: $installer" }
-
-    # Refuse to install over a running browser. Inno would prompt to close it,
-    # but this path runs unattended from a toast click, where a modal prompt
-    # nobody sees looks like a hang.
-    $running = Get-Process -Name "thorium", "chrome" -ErrorAction SilentlyContinue |
-               Where-Object { $_.Path -and $Installed -and $Installed.InstallPath -and $_.Path.StartsWith($Installed.InstallPath, [StringComparison]::OrdinalIgnoreCase) }
-    if ($running) {
-        Say "Thorium Zen5 is running. Close it and run this again, or install manually: $installer"
-        return 1
-    }
-
-    Say "Installing $($Available.Version)..."
-    # VERYSILENT with no restart; Inno returns 0 on success.
-    $p = Start-Process -FilePath $installer -ArgumentList @("/VERYSILENT", "/NORESTART", "/SUPPRESSMSGBOXES") -Wait -PassThru
-    if ($p.ExitCode -ne 0) { throw "Installer exited $($p.ExitCode)." }
-    Say "Installed $($Available.Version)."
-    return 0
-}
-
-# ---------------------------------------------------------------------------
 try {
+    $release   = Get-NewestRelease -Profile $Profile
     $installed = Get-InstalledBuild
-    $available = Get-AvailableBuild
+    $newer     = Test-ReleaseIsNewer $release $installed
 
+    # ---------------------------------------------------------------- quiet
+    if ($Quiet) { if ($newer) { exit 10 } else { exit 0 } }
+
+    # ------------------------------------------------------------- -Install
     if ($Install) {
-        exit (Install-Build $available $installed)
+        if (-not $release) { Write-Host "No complete release under releases\."; exit 1 }
+        if (-not $newer -and -not $Force) { Write-Host "Installed $(Get-VersionText $installed) is current."; exit 0 }
+        $code = Invoke-Install $release
+        Log "install requested: $($release.Version) ($($release.Name)) -> exit $code"
+        if ($code -eq 0) { Set-UpdateShortcut }
+        exit $code
     }
 
-    if (-not $available) {
-        Say "No complete packaged release for profile '$Profile' found via $Source."
-        exit 0
+    # --------------------------------------------------------- desktop icon
+    if ($Interactive) {
+        try { $Host.UI.RawUI.WindowTitle = "Update Chromium (Zen 5)" } catch { }
+        Write-Host "Installed : $(Get-VersionText $installed)"
+        Write-Host ("Available : " + $(if ($release) { "$($release.Version)   ($($release.Name))" } else { "none" }))
+        Write-Host ""
+        $code = 0
+        if (-not $release) {
+            Write-Host "No complete packaged release under releases\." -ForegroundColor Yellow
+        } elseif (-not $newer) {
+            Write-Host "Up to date." -ForegroundColor Green
+            Set-UpdateShortcut
+        } else {
+            $wasOpen = (Get-BrowserProcesses).Count -gt 0
+            $go = $true
+            while ((Get-BrowserProcesses).Count -gt 0) {
+                $a = Read-Host "Chromium is open. Close all its windows, then press Enter to install $($release.Version) (N to cancel)"
+                if ($a -match '^[Nn]') { $go = $false; break }
+            }
+            if (-not $go) {
+                Write-Host "Not installed."
+                $code = 10
+            } else {
+                $code = Invoke-Install $release
+                Log "desktop install: $($release.Version) (was $(Get-VersionText $installed)) -> exit $code"
+                Write-Host ""
+                if ($code -eq 0) {
+                    Write-Host "Updated to $($release.Version)." -ForegroundColor Green
+                    Set-UpdateShortcut
+                    if ($wasOpen) { Start-Process -FilePath (Join-Path $InstallDir "chrome.exe") }
+                } else {
+                    Write-Host "Update did not complete (exit $code)." -ForegroundColor Red
+                }
+            }
+        }
+        Write-Host ""
+        Read-Host "Press Enter to close" | Out-Null
+        exit $code
     }
 
-    if (-not (Test-IsNewer $available $installed) -and -not $Force) {
-        $what = if ($installed) { "Installed $($installed.Version) is current." } else { "Nothing installed, and nothing newer available." }
-        Say $what
-        exit 0
+    # --------------------------------------------------------------- deploy
+    if (-not $newer) { Set-UpdateShortcut; exit 0 }
+
+    $state = Get-State
+    if ((Get-BrowserProcesses).Count -gt 0) {
+        Set-UpdateShortcut -PendingVersion $release.Version
+        if ($state.Notified -ne $release.Name) {
+            Log "waiting: $($release.Version) ($($release.Name)) is ready, installed $(Get-VersionText $installed), browser open"
+            $null = Show-ThoriumToast -Title "Chromium $($release.Version) is ready" `
+                -Body "It installs by itself at the next hourly check with Chromium closed, or now from the 'Install Chromium $($release.Version)' icon on the desktop."
+            $state.Notified = $release.Name
+            Save-State $state
+        }
+        exit 10
     }
 
-    if ($Force -and -not (Test-IsNewer $available $installed)) {
-        Say "-Force: installed build is already current; raising the notification anyway to test it."
+    if ($state.Failed -eq $release.Name) {
+        # Already failed once for this build; do not retry or re-toast every hour.
+        Set-UpdateShortcut -PendingVersion $release.Version
+        exit 1
     }
-    Say "Update available: $($available.Version) (installed: $(if ($installed) { $installed.Version } else { 'none' }))"
-    if ($Quiet) { exit 10 }
 
-    $from  = if ($installed) { $installed.Version } else { "nothing installed yet" }
-    $title = "Thorium Zen5 update ready"
-    $body  = "Chromium $($available.Version) is built and ready. Installed: $from. Click the Thorium Zen5 icon in the system tray to install it."
-    if (Show-ThoriumNotification -Title $title -Body $body -TimeoutMinutes $TimeoutMinutes `
-            -TrayTooltip "Install Thorium Zen5 $($available.Version)") {
-        exit (Install-Build $available $installed)
+    Log "auto-install: $($release.Version) ($($release.Name)), was $(Get-VersionText $installed)"
+    $code = Invoke-Install $release
+    Log "auto-install: exit $code"
+    switch ($code) {
+        0 {
+            Set-UpdateShortcut
+            $null = Show-ThoriumToast -Title "Chromium $($release.Version) installed" `
+                -Body "Installed while the browser was closed. Previous version: $(Get-VersionText $installed)."
+            $state.Notified = ""; $state.Failed = ""; Save-State $state
+            exit 0
+        }
+        { $_ -in 3, 4 } {
+            # The browser opened, or another install started, in the meantime.
+            Set-UpdateShortcut -PendingVersion $release.Version
+            exit 10
+        }
+        default {
+            Set-UpdateShortcut -PendingVersion $release.Version
+            $null = Show-ThoriumToast -Title "Chromium $($release.Version) did not install" `
+                -Body "Install-Build exited $code. Details in build\logs\offer.log. The desktop icon can retry."
+            $state.Failed = $release.Name; Save-State $state
+            exit 1
+        }
     }
-    Say "Not installed. The build stays in $($available.Dir); run with -Install whenever you want it."
-    exit 10
 } catch {
-    if (-not $Quiet) { Write-Error $_ }
+    Log "FAILED: $($_.Exception.Message)"
+    if ($Interactive) {
+        Write-Host "FAILED: $($_.Exception.Message)" -ForegroundColor Red
+        Read-Host "Press Enter to close" | Out-Null
+    } elseif (-not $Quiet) { Write-Host "FAILED: $($_.Exception.Message)" }
     exit 1
 }

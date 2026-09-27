@@ -3,71 +3,68 @@
 ## Layout
 
 ```
-C:\thorium\                    (this repo's root, = RepoRoot)
-  build.ps1                    orchestrator: audit/sync/configure/build/test/analyze/benchmark/package/installer/all
-  update.ps1                   automated upstream-update pipeline
-  verify-source.ps1            source/config integrity checks -> build/source-verification.json
+C:\thorium\                    (repo root)
+  build.ps1                    stages: sync/configure/build/test/analyze/package/publish
+  update.ps1                   nightly pipeline: runs the stages, publishes, deploys
+  verify-source.ps1            proves the targeting reached the generated ninja
+  check.cmd update.cmd install.cmd verify.cmd   double-click launchers
   scripts\
-    ChromiumVersion.ps1        stable-version resolution + downgrade guard, shared by build.ps1 and update.ps1
-    audit_build.py             probes the checkout and the pinned clang -> build/audit.json
-    apply_zen5_patches.py      the patcher: adds use_znver5 and the targeting block to a stock tree
-    analyze_isa.py             disassembles the built binary and counts real AVX-512 instructions
-    benchmark.py               startup timing (+ Speedometer if a checkout is supplied)
-    compare_builds.py          cross-profile comparison report
-    generate_manifest.py       build-manifest-<profile>.json
-  gn\                          args.gn profiles: _common_args.gni.txt + win_{baseline,zen5,generic_avx512}_args.gn
-  patches\zen5\                the captured diff of the last successful patch application, plus its README
-  installer\                   Inno Setup script + docs
-  benchmarks\                  benchmark docs/inputs
+    Common.ps1                 shared: paths, version rules, releases, installed build, desktop icon, toast
+    Check-ThoriumUpdate.ps1    deploy (scheduled) and the desktop icon (-Interactive)
+    Install-Build.ps1          the one install implementation, verified
+    Install-ThoriumTasks.ps1   registers the two scheduled tasks
+    Run-Tests.ps1              base_unittests gate + known-test-failures.txt + parse_test_summary.py
+    apply_zen5_patches.py      adds use_znver5 and the targeting block to a stock tree
+    generate_manifest.py       build-manifest-<profile>.json, including the chrome.dll hash
+    analyze_isa.py             disassembles chrome.dll and counts real AVX-512 instructions
+    Repair-UrlProtocolShadowing.ps1   manual diagnostic (docs/HISTORY.md, 2026-09-19)
+    run_bench_suite.py, speedometer_cdp.py, Start-BenchBrowser.ps1,
+    compare_builds.py, attribute_isa.py   manual benchmarking and analysis tools
+  gn\                          _common_args.gni.txt + win_{baseline,zen5}_args.gn
+  patches\zen5\                reference diff of the patch, plus its README
+  benchmarks\                  recorded benchmark results
   docs\                        this directory
-  build\                       ALL generated artifacts: audit.json, isa-report-*.json/.txt,
-                               benchmark-*.json, build-manifest-*.json, compare-report.json,
-                               source-verification.json, chromium-tag.txt, logs\*.log
-  releases\                    packaged installers + their reports (git-ignored; large binaries)
-  depot_tools\                 cloned from chromium.googlesource.com (git-ignored)
-  src\                         the Chromium checkout (git-ignored, ~30GB+ fetched, ~100GB+ after a build)
+  build\                       generated state (ignored): manifests, ISA reports, logs\,
+                               chromium-tag.txt, configured-<profile>.json, run-state.json
+  releases\                    packaged builds (ignored; large binaries)
+  depot_tools\, src\           fetched (ignored)
 ```
 
-Only the orchestration scripts, Python tools, GN profiles, the captured
-patch diff, the installer script and the docs are tracked. Anything
-downloaded or generated (`depot_tools/`, `src/`, `build/`, `releases/`) is
-`.gitignore`d. `build.ps1 sync` + `build.ps1 configure` regenerate all of
-it deterministically from tracked inputs plus whatever Chromium stable is
-current at sync time, which is itself recorded in
-`build/build-manifest-<profile>.json` for every build.
+Tracked: scripts, GN profiles, the reference diff, docs. Everything
+downloaded or generated is ignored and reproducible from `build.ps1 sync`
+and `configure` against whatever Chromium stable is current, which each
+build's manifest records.
 
-## One checkout, one patch, three profiles
+## One checkout, one patch, two profiles
 
 There is no source overlay. `src/` is a stock Chromium checkout pinned to
 a stable tag, and the only file this project modifies is
-`build/config/compiler/BUILD.gn` (see `build/audit.json` ->
-`modified_files`). `scripts/apply_zen5_patches.py` inserts two blocks into
+`build/config/compiler/BUILD.gn` (`verify-source.ps1` fails if anything
+else differs from the tag). `scripts/apply_zen5_patches.py` inserts two blocks into
 it: a `declare_args()` defining the `zen5_*` arguments, and a targeting
 block inside `config("compiler")` that emits `-march`/`-mtune` for x64
 Windows clang builds.
 
 Every argument the patch declares defaults to the value that reproduces
 stock behaviour, so a patched tree with `use_znver5` unset compiles
-identically to an unpatched one. The three profiles differ only in
-`args.gn`:
+identically to an unpatched one. The profiles differ only in `args.gn`:
 
-- `baseline` -- tree left completely unpatched, on purpose. `build.ps1
-  configure` skips the patcher entirely for this profile.
+- `baseline` -- stock Chromium. `build.ps1 configure` does not apply the
+  patch for it; if a zen5 configure left the patch in place, the output is
+  still stock because `use_znver5` defaults to false.
 - `zen5` -- `use_znver5 = true`.
-- `generic-avx512` -- `use_generic_avx512 = true`. Kept as a comparison
-  point only. It is measured to emit **zero** 512-bit instructions,
-  because clang defaults `skylake-avx512` to `prefer-vector-width=256`, so
-  it is not "the AVX-512 build".
 
-`gn/_common_args.gni.txt` holds everything the three profiles share and is
+The patch also declares `use_generic_avx512`. The profile that set it was
+removed on 2026-09-27: it was measured to emit zero 512-bit instructions
+(clang defaults `skylake-avx512` to `prefer-vector-width=256`).
+
+`gn/_common_args.gni.txt` holds everything the profiles share and is
 concatenated with the per-profile block at configure time, so the profiles
 cannot drift apart in anything other than their CPU-targeting lines. If
 they did, the comparison between them would be meaningless.
 
 Switching profiles is `gn gen` into a different `out/` directory. Nothing
-is copied and no source is re-overlaid, so profiles can coexist. Going
-from `zen5` to `baseline` does require the patcher's edits to be reverted
-first, which `build.ps1 sync` does for free via `git checkout -f`.
+is copied and no source is re-overlaid, so profiles can coexist.
 
 ## How the tree gets patched, and why that survives an update
 
@@ -104,10 +101,8 @@ deliberately does not touch that mechanism. Forcing e.g. Highway to pick
 its AVX-512 target at compile time would remove its ability to fall back,
 for no benefit that `-march` does not already give the rest of the build.
 
-`build/audit.json` -> `third_party_dispatch_survey` records the scan that
-established this, per library, with the files the dispatch signature was
-found in. It is regenerated by `build.ps1 sync` and again by `build.ps1
-configure`, against the real checked-out tree.
+This was established by a survey of the checkout (the audit stage, removed
+on 2026-09-27), per library.
 
 ## PGO
 
@@ -124,10 +119,6 @@ whereas the official profile arrives free on every sync. It is
 intentionally out of scope for the default pipeline. See `docs/BUILD.md`
 "About PGO".
 
-Known sharp edge: `Get-OrDownloadPgoProfile` returns the newest existing
-`chrome-win64-*.profdata` unless `-Force` is passed. `update.ps1` does pass
-`-Force`, so the automated path always refreshes it, but a hand-run
-`build.ps1 configure` after a milestone bump will silently reuse the
-previous milestone's profile. `chrome/build/win64.pgo.txt` names the
-profile the checked-out revision expects and is the right thing to check
-against.
+`build.ps1 configure` uses the profile that `chrome/build/win64.pgo.txt`
+names and downloads it when it is missing, so a milestone bump always gets
+the matching profile. `-Force` re-downloads regardless.

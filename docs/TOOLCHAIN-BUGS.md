@@ -91,7 +91,7 @@ Zen 5 instruction **scheduling** only. The full ISA, 512-bit vectorization,
 PGO and ThinLTO are unaffected. On an 8-wide out-of-order core with a ~448-entry
 reorder buffer, static scheduling is a second-order effect; PGO (which governs
 inlining and block layout) is applied identically either way. This has not been
-benchmarked here — `build.ps1 benchmark` is the way to quantify it.
+benchmarked here — `scripts/run_bench_suite.py` is the way to quantify it.
 
 ### Recovery
 

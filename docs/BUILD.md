@@ -36,81 +36,60 @@ highly parallel `autoninja -jN` with ThinLTO.
 ```powershell
 cd C:\thorium
 .\build.ps1 sync                      # fetch Chromium, pin to current stable, gclient sync. HOURS.
-.\build.ps1 configure -Profile zen5   # apply zen5 patches, write args.gn, gn gen. Minutes.
+.\build.ps1 configure -Profile zen5   # apply the zen5 patch, write args.gn, gn gen. Minutes.
+.\verify-source.ps1 -Profile zen5     # the targeting reached the generated ninja. Seconds.
 .\build.ps1 build -Profile zen5       # autoninja chrome + mini_installer. HOURS first time.
 .\build.ps1 test -Profile zen5        # base_unittests + a headless smoke test
-.\build.ps1 analyze -Profile zen5     # real ISA report from the built binary
-.\build.ps1 benchmark -Profile zen5   # startup benchmark (+ Speedometer if configured)
-.\build.ps1 package -Profile zen5     # stage a release folder under releases\
-.\build.ps1 installer -Profile zen5   # build the Windows installer
+.\build.ps1 analyze -Profile zen5     # ISA report from the built chrome.dll
+.\build.ps1 package -Profile zen5     # release folder under releases\
+.\build.ps1 publish -Profile zen5     # GitHub Releases (needs gh auth login)
 ```
 
-or simply:
+After the first build, `update.ps1` runs all of this unattended; see
+`docs/UPDATES.md`. Then register the scheduled tasks and the desktop icon
+appears on the next deploy:
 
 ```powershell
-.\build.ps1 all
+.\scripts\Install-ThoriumTasks.ps1
 ```
 
-which runs all of the above in order and stops at the first failure, so no
-partial or broken release is ever packaged.
-
 `build.ps1 build -Target <ninja-target>` builds named targets only and
-writes no manifest. Use it for fast toolchain canaries;
-`net/tools/root_store_tool` is about 2,500 steps and roughly two minutes,
-which is what the toolchain-bug matrices in `docs/TOOLCHAIN-BUGS.md` were
-bisected with.
+writes no manifest. `root_store_tool` is about 2,500 steps and two minutes
+and still links base under ThinLTO, which is what the toolchain-bug matrices
+in `docs/TOOLCHAIN-BUGS.md` were bisected with.
 
-## Building the comparison profiles
+## The baseline profile
 
 ```powershell
 .\build.ps1 configure -Profile baseline
 .\build.ps1 build -Profile baseline
 .\build.ps1 analyze -Profile baseline
-
-.\build.ps1 configure -Profile generic-avx512
-.\build.ps1 build -Profile generic-avx512
-.\build.ps1 analyze -Profile generic-avx512
-
-python3 scripts\compare_builds.py --repo-root C:\thorium
+python scripts\compare_builds.py --repo-root C:\thorium --profiles baseline zen5
 ```
 
-Each profile builds into its own `out/thorium-<profile>` directory, so
-they can coexist; only `baseline` requires the patcher's edits to be out
-of the tree, which `build.ps1 sync` handles via `git checkout -f`.
-
-**This has not been done yet.** No `baseline` build exists, so the
-performance value of the Zen 5 targeting is currently unmeasured and
-`docs/BENCHMARKS.md` is empty.
+Stock Chromium with the same shared args, in its own `out\thorium-baseline`.
+Comparisons are recorded in `docs/BENCHMARKS.md`.
 
 ## About PGO
 
-`build.ps1 configure` downloads Google's official, generic win64 Chrome
-PGO profile via Chromium's own `tools/update_pgo_profiles.py` and
-substitutes its path into `args.gn`'s `pgo_data_path`. It is
-milestone-matched to the checkout but **not** Zen5-trained and not trained
+`build.ps1 configure` uses Google's official, generic win64 Chrome PGO
+profile, the one `chrome/build/win64.pgo.txt` names for the checked-out
+revision, downloading it via Chromium's `tools/update_pgo_profiles.py` when
+missing. It is milestone-matched but **not** Zen 5-trained and not trained
 on this machine's workload.
 
-Training a local profile is a real undertaking: an instrumented
-`chrome_pgo_phase=1` build, a representative interactive workload, a
-`.profraw` -> `.profdata` merge, then a second full build, repeated every
-milestone. It is intentionally out of scope for the default pipeline.
-`-TrainPgo` is reserved on `build.ps1` for this and is not implemented.
-
-Caveat worth knowing: `Get-OrDownloadPgoProfile` reuses the newest
-existing `chrome-win64-*.profdata` unless `-Force` is passed. `update.ps1`
-always passes `-Force`, but a hand-run `configure` after a milestone bump
-will silently reuse the old milestone's profile.
-`chrome/build/win64.pgo.txt` names the profile the current revision
-expects.
+Training a local profile means an instrumented `chrome_pgo_phase=1` build, a
+representative workload, a `.profraw` to `.profdata` merge and a second full
+build, repeated every milestone. Out of scope for the pipeline.
 
 ## Code signing
 
-Not configured by default -- see `installer/README.md`.
+None. This is a personal build; SmartScreen may warn when a release's
+installer is run by hand. The deploy path runs it silently and is
+unaffected.
 
-## Clang / znver5 support
+## Clang and znver5
 
-`scripts/audit_build.py` probes the pinned clang (pulled by `gclient
-runhooks`) for `-march=znver5` recognition and records the result in
-`build/audit.json`. `build.ps1 configure -Profile zen5` reads that back and
-**throws** if the probe failed, rather than letting the build silently
-degrade to a coarser target.
+The pinned clang must know `-march=znver5`. If it did not, the compile would
+fail outright ("unknown target CPU"), and `verify-source.ps1` separately
+asserts `-march=znver5` is in the generated ninja before any build starts.

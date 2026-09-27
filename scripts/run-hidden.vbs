@@ -1,12 +1,10 @@
-' Launch a PowerShell script with NO console window.
+' Run a PowerShell script with no console window, and wait for it.
 '
-' powershell.exe -WindowStyle Hidden is NOT enough on Windows 11: Windows
-' Terminal is the default console host, and it creates its own window before
-' PowerShell ever gets to honour -WindowStyle. The update checker therefore
-' flashed a visible terminal on every run, six times a day.
-'
-' WScript.Shell.Run with intWindowStyle = 0 suppresses the window at creation,
-' which is the only thing Terminal cannot override.
+' powershell.exe -WindowStyle Hidden is not enough on Windows 11: Windows
+' Terminal creates its window before PowerShell can honour the flag.
+' WScript.Shell.Run with window style 0 suppresses it at creation. Waiting
+' (True) keeps the scheduled task alive for the script's lifetime, so the
+' task's time limit and IgnoreNew apply to the script itself.
 '
 ' Usage: wscript.exe run-hidden.vbs <script.ps1> [args...]
 Option Explicit
@@ -17,4 +15,4 @@ cmd = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File """ & WScript.Arg
 For i = 1 To WScript.Arguments.Count - 1
   cmd = cmd & " """ & WScript.Arguments(i) & """"
 Next
-sh.Run cmd, 0, False
+WScript.Quit sh.Run(cmd, 0, True)
