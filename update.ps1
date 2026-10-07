@@ -122,7 +122,8 @@ if (-not $CheckOnly) {
 # ---------------------------------------------------------------------------
 # What exists: upstream, synced, built, released, installed
 # ---------------------------------------------------------------------------
-if (-not (Test-Path $SrcDir)) { throw "No Chromium checkout at $SrcDir. Run '.\build.ps1 sync' once first." }
+# No checkout yet is a first run, not an error: the sync stage fetches it
+# (tens of GB, hours), and the missing build triggers the rebuild below.
 $tagFile      = Join-Path $ThoriumBuild "chromium-tag.txt"
 $localTag     = if (Test-Path $tagFile) { (Get-Content $tagFile -Raw).Trim() } else { $null }
 $latestTag    = Resolve-ChromiumStableTag
@@ -163,6 +164,11 @@ function Test-ClangRoll {
 
 function Invoke-Publish {
     # Non-fatal: the build is fine and packaged; publish is retried next run.
+    # Without the GitHub CLI there is nowhere to publish to, so skip quietly.
+    if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+        Log "GitHub CLI (gh) not installed; publish skipped. Releases stay in releases\."
+        return $false
+    }
     try {
         & (Join-Path $RepoRoot "build.ps1") publish -Profile $Profile
         return $true
@@ -182,7 +188,7 @@ function Invoke-Deploy {
 if ($reasons.Count -eq 0 -and -not $explicit) {
     if ($CheckOnly) { Log "CheckOnly: up to date."; exit 0 }
     Test-ClangRoll
-    if ($release -and -not $release.Published) {
+    if ($release -and -not $release.Published -and (Get-Command gh -ErrorAction SilentlyContinue)) {
         Log "Newest release $($release.Name) was never published; publishing now."
         $null = Invoke-Publish
     }

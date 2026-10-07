@@ -13,6 +13,7 @@ C:\thorium\                    (repo root)
     Check-ThoriumUpdate.ps1    deploy (scheduled) and the desktop icon (-Interactive)
     Install-Build.ps1          the one install implementation, verified
     Install-ThoriumTasks.ps1   registers the two scheduled tasks
+    Test-Prerequisites.ps1     read-only check that a machine can build and run it
     Run-Tests.ps1              base_unittests gate + known-test-failures.txt + parse_test_summary.py
     apply_zen5_patches.py      adds use_znver5 and the targeting block to a stock tree
     generate_manifest.py       build-manifest-<profile>.json, including the chrome.dll hash

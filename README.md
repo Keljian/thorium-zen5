@@ -23,6 +23,61 @@ Day to day there is nothing to run: a new build installs itself when
 Chromium is closed, or the desktop icon turns into "Install Chromium
 <version>" while it is open. See `docs/UPDATES.md`.
 
+## Setting up on a new machine
+
+What it needs (`scripts\Test-Prerequisites.ps1` checks all of it):
+
+| | |
+|---|---|
+| CPU | AMD Zen 5 (for example a Ryzen 9000-series desktop). The build is unusable on older CPUs, and the pipeline runs it during testing. |
+| OS | Windows 11 x64 |
+| Memory | 32 GB or more; 64 GB is comfortable |
+| Disk | 150 GB or more free on the drive that holds the repo |
+| Visual Studio | 2022 or 2026, Community or Build Tools, with "Desktop development with C++" and a Windows 11 SDK |
+| Git, Python | Git for Windows and Python 3 from python.org, both on PATH |
+| GitHub CLI | Optional. Only needed to publish releases to GitHub. |
+
+Then:
+
+1. **Clone to a short path** (Chromium's tree has very long paths), with
+   depot_tools inside it:
+
+   ```powershell
+   git clone https://github.com/Keljian/thorium-zen5.git C:\thorium
+   cd C:\thorium
+   git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
+   ```
+
+   The repository is private. Use your own private fork rather than a
+   public one; `docs/UPDATES.md` "Publishing" says why.
+
+2. **Check the machine:**
+   `powershell -ExecutionPolicy Bypass -File scripts\Test-Prerequisites.ps1`
+
+3. **First build:** double-click `update.cmd`. It fetches Chromium (tens of
+   GB), applies the patch, verifies the targeting, builds, tests, packages,
+   and installs the result if Chromium is not open. Expect several hours;
+   the first fetch depends mostly on your connection. The machine stays
+   usable while it runs.
+
+4. **Keep it updated:**
+   `powershell -ExecutionPolicy Bypass -File scripts\Install-ThoriumTasks.ps1`
+   registers a nightly rebuild (03:00, only when Chromium stable has moved)
+   and an hourly check that installs new builds while the browser is
+   closed. An "Update Chromium" icon on the desktop installs on demand.
+
+5. **Optional, publishing:** `gh auth login`. Releases go to the GitHub
+   repository `origin` points at.
+
+Worth knowing:
+
+- It installs as "Chromium" in `%LOCALAPPDATA%\Chromium\Application`, with
+  its own profile, separate from Google Chrome. Make it the default browser
+  in Settings > Apps > Default apps; Windows does not let a script do that.
+- No Google API keys are built in, so Chrome Sync and Safe Browsing's
+  online lookups do not work.
+- If a build fails you get a toast; the reason is in `build\logs\update.log`.
+
 ## Start here
 
 - **`docs/BUILD.md`** -- prerequisites and the full build walkthrough.
@@ -59,7 +114,7 @@ comparison point.
 ## Status
 
 The measurements below were taken on Chromium 154.0.8037.17. The installed
-build tracks Chromium stable (155.0.8059.12 as of 2026-09-27).
+build tracks Chromium stable (155.0.8059.40 as of 2026-10-07).
 
 ### The targeting is verified, not assumed
 

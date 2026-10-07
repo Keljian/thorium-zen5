@@ -352,9 +352,24 @@ function Invoke-Sync {
 # configure
 # ---------------------------------------------------------------------------
 function Get-PgoProfile {
-    # chrome\build\win64.pgo.txt names the profile this revision expects.
-    # Using it (rather than the newest file on disk) is what stops a milestone
-    # bump silently building with the previous milestone's profile.
+    # Two profiles, each refreshed on its own key.
+    #
+    # V8's builtins profile is keyed by the V8 version in v8-version.h, which
+    # moves on most patch releases. mksnapshot runs with
+    # --abort-on-bad-builtin-profile-data, so a stale one kills the build
+    # (2026-10-07: profile for 15.5.35.14, checkout 15.5.35.20, mksnapshot
+    # exited 0x80000003). download_profiles.py skips the download when
+    # meta.json already matches, and --check-v8-revision fails with a clear
+    # message if the profile was built for a different V8 revision.
+    $toolEnv = Get-DepotToolsEnv
+    $py = Get-PythonExe
+    $v8Args = @("v8/tools/builtins-pgo/download_profiles.py", "--depot-tools=$DepotTools", "download", "--check-v8-revision")
+    if ($Force) { $v8Args += "--force" }
+    Invoke-Logged -Exe $py -Arguments $v8Args -WorkingDirectory $SrcDir -EnvVars $toolEnv
+
+    # Chrome's profile is the one chrome\build\win64.pgo.txt names. Using it
+    # (rather than the newest file on disk) is what stops a milestone bump
+    # silently building with the previous milestone's profile.
     $pgoDir = Join-Path $SrcDir "chrome\build\pgo_profiles"
     $want = Get-Content (Join-Path $SrcDir "chrome\build\win64.pgo.txt") -ErrorAction SilentlyContinue |
             ForEach-Object { $_.Trim() } | Where-Object { $_ } | Select-Object -First 1
@@ -362,12 +377,8 @@ function Get-PgoProfile {
     if ($wantPath -and (Test-Path $wantPath) -and -not $Force) { return $wantPath }
 
     Write-Log "Downloading Chromium's generic win64 PGO profile$(if ($want) { " ($want)" })."
-    $toolEnv = Get-DepotToolsEnv
-    $py = Get-PythonExe
     Invoke-Logged -Exe $py -Arguments @("tools/update_pgo_profiles.py", "--target=win64", "update",
         "--gs-url-base=chromium-optimization-profiles/pgo_profiles") -WorkingDirectory $SrcDir -EnvVars $toolEnv
-    Invoke-Logged -Exe $py -Arguments @("v8/tools/builtins-pgo/download_profiles.py",
-        "--depot-tools=$DepotTools", "--force", "download") -WorkingDirectory $SrcDir -EnvVars $toolEnv
     if ($wantPath -and (Test-Path $wantPath)) { return $wantPath }
     $got = Get-ChildItem $pgoDir -Filter "chrome-win64-*.profdata" -ErrorAction SilentlyContinue |
            Sort-Object LastWriteTime -Descending | Select-Object -First 1

@@ -129,3 +129,12 @@ Audit findings fixed and the scripts shrunk:
 - Removed: the audit stage, the benchmark stage, the generic-avx512
   profile, the Inno Setup chain, `build.ps1 all`, `-Source GitHub`, and the
   patched-tag marker. Shared code lives in `scripts/Common.ps1`.
+
+## 2026-10-07
+
+- **mksnapshot crashed (0x80000003) building 155.0.8059.40.** The
+  2026-09-27 PGO change refreshed V8's builtins profile only when Chrome's
+  profile changed. .26 to .40 kept the same Chrome profile but moved V8 from
+  15.5.35.14 to 15.5.35.20, and mksnapshot runs with
+  `--abort-on-bad-builtin-profile-data`. Configure now checks the V8
+  profile against the V8 version (and revision) every time.

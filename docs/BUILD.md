@@ -5,25 +5,25 @@ source overlay; see `docs/ARCHITECTURE.md` for why it was dropped.
 
 ## Prerequisites (one-time, on the build machine)
 
-- Windows 11 x64
-- Visual Studio 2019 or 2022/2026 Build Tools, "Desktop development with
-  C++" workload, plus the Windows 10/11 SDK **with its Debugging Tools**
-  component (Control Panel -> Programs and Features -> "Windows Software
-  Development Kit" -> Change -> check "Debugging Tools for Windows").
-- Git for Windows, Python 3, on `PATH`.
-- `depot_tools`: `git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\thorium\depot_tools`
-- Environment variables (System Properties -> Environment Variables):
-  - Put `C:\thorium\depot_tools` at the **front** of `PATH`.
-  - `DEPOT_TOOLS_WIN_TOOLCHAIN=0` (use locally installed Visual Studio
-    rather than the Google-internal toolchain).
-  - `NINJA_SUMMARIZE_BUILD=1`
+Run `scripts\Test-Prerequisites.ps1` to check all of these at once.
 
-`build.ps1` constructs a minimal, explicit environment for every child
-process it launches (see `Get-DepotToolsEnv`), so a missing global env var
-will not silently break a run and the build behaves the same from an
-interactive shell, a scheduled task or a remote agent. A completely absent
-Visual Studio or Windows SDK will still fail, loudly, before any real work
-starts.
+- An AMD Zen 5 CPU. The output uses the full znver5 instruction set and the
+  test stage runs it, so the build cannot complete on anything older.
+- Windows 11 x64.
+- Visual Studio 2022 or 2026 (Community or Build Tools) with the "Desktop
+  development with C++" workload and a Windows 11 SDK. Chromium pins one
+  exact SDK version; `build.ps1 configure` names it if it is missing.
+- Git for Windows and Python 3 (from python.org, not the Microsoft Store
+  alias), both on `PATH`.
+- `depot_tools` cloned inside the repo:
+  `git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\thorium\depot_tools`
+- Optional: the GitHub CLI (`gh auth login`) for publishing releases.
+  Without it, publishing is skipped and everything else works.
+
+No global environment variables are needed. `build.ps1` builds an explicit
+environment for every child process (see `Get-DepotToolsEnv`), including
+`DEPOT_TOOLS_WIN_TOOLCHAIN=0` and depot_tools on `PATH`, so it behaves the
+same from a terminal, a scheduled task or a remote shell.
 
 Disk/RAM: budget **150GB+ free disk** (source plus one `out/` dir per
 profile; each `out/` dir alone is commonly 40-80GB for an official/LTO
@@ -32,6 +32,9 @@ build, and the ThinLTO cache policy allows up to 40GB on its own) and
 highly parallel `autoninja -jN` with ThinLTO.
 
 ## First build, start to finish
+
+The short way is `update.cmd`: on a machine with no checkout it fetches
+Chromium and runs every stage below. Step by step:
 
 ```powershell
 cd C:\thorium
