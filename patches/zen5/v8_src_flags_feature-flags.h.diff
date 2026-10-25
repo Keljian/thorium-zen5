@@ -1,0 +1,44 @@
+--- a/v8/src/flags/feature-flags.h
++++ b/v8/src/flags/feature-flags.h
+@@ -48,6 +48,20 @@
+ #else
+ #define IF_REVEC_ENABLED(then, feature_name, description)
+ #endif  // V8_ENABLE_WASM_SIMD256_REVEC
++
++// --- thorium-zen5: ship wasm_revectorize ---
++// With V8_ZEN5_SHIP_WASM_REVEC, wasm_revectorize is listed as SHIPPED
++// (default on) instead of STAGED. Otherwise stock behaviour.
++#if defined(V8_ENABLE_WASM_SIMD256_REVEC) && \
++    defined(V8_ZEN5_SHIP_WASM_REVEC)
++#define IF_REVEC_STAGED(then, feature_name, description)
++#define IF_REVEC_SHIPPED(then, feature_name, description) \
++  then(feature_name, description)
++#else
++#define IF_REVEC_STAGED(then, feature_name, description) \
++  IF_REVEC_ENABLED(then, feature_name, description)
++#define IF_REVEC_SHIPPED(then, feature_name, description)
++#endif
+ 
+ #ifdef V8_ENABLE_SPARKPLUG_PLUS
+ #define IF_SPARKPLUG_PLUS_ENABLED(then, feature_name, description) \
+@@ -184,7 +198,7 @@
+   /* Wasm Re-vectorization (no proposal, engine optimization only). */         \
+   /* V8 side owner: jkummerow */                                               \
+   /* Staged in 15.4 */                                                         \
+-  IF_REVEC_ENABLED(INTERNAL_FEATURE, wasm_revectorize,                         \
++  IF_REVEC_STAGED(INTERNAL_FEATURE, wasm_revectorize,                          \
+                    "128 to 256 bit SIMD re-vectorization for Wasm")            \
+                                                                                \
+   /* Wide Arithmetic proposal */                                               \
+@@ -236,6 +250,10 @@
+                                                                                \
+   INTERNAL_FEATURE(homomorphic_ic,                                             \
+                    "Homomorphic IC state for same-handler highly polymorphic " \
+-                   "ICs")
++                   "ICs")                                                       \
++                                                                               \
++  /* thorium-zen5: ship wasm_revectorize */                         \
++  IF_REVEC_SHIPPED(INTERNAL_FEATURE, wasm_revectorize,                        \
++                   "128 to 256 bit SIMD re-vectorization for Wasm")
+ 
+ #endif  // V8_FLAGS_FEATURE_FLAGS_H_

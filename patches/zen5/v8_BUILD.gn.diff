@@ -1,0 +1,13 @@
+--- a/v8/BUILD.gn
++++ b/v8/BUILD.gn
+@@ -1638,6 +1638,10 @@
+   }
+   if (v8_enable_wasm_simd256_revec) {
+     defines += [ "V8_ENABLE_WASM_SIMD256_REVEC" ]
++  }
++  # --- thorium-zen5: ship wasm_revectorize ---
++  if (v8_enable_wasm_simd256_revec && v8_zen5_ship_wasm_revec) {
++    defines += [ "V8_ZEN5_SHIP_WASM_REVEC" ]
+   }
+   if (v8_enable_maglev_graph_printer) {
+     defines += [ "V8_ENABLE_MAGLEV_GRAPH_PRINTER" ]

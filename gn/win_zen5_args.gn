@@ -168,3 +168,17 @@ zen5_mtune = "znver5"
 # Set to "" once LLVM fixes the ISel gap. The failure is a hard link error.
 
 zen5_slp_max_reg_size = "256"
+
+# WASM REVECTORIZATION ON BY DEFAULT
+# ----------------------------------
+# V8 compiles its Wasm 128->256-bit SIMD revectorizer into every x64 build but
+# leaves the runtime feature (wasm_revectorize) STAGED, i.e. off unless the
+# browser is launched with --js-flags=--wasm-revectorize. A launch switch is
+# lost on links and protocol launches, so this bakes it in instead:
+# v8_zen5_ship_wasm_revec is an arg THIS PROJECT adds (apply_zen5_patches.py)
+# that moves the feature to V8's SHIPPED list. Baseline stays stock.
+#
+# Affects WebAssembly SIMD only; plain JavaScript is unchanged. Still gated at
+# runtime on AVX2 and on the module using SIMD, and still switchable off with
+# --js-flags=--no-wasm-revectorize.
+v8_zen5_ship_wasm_revec = true

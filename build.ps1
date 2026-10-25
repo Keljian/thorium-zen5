@@ -187,6 +187,7 @@ function Invoke-Logged {
     }
     $proc.WaitForExit()
     $script:LastCommandTail = ($tail -join "`n")
+    $script:LastCommandExitCode = $proc.ExitCode
     if ($AllowedExitCodes -notcontains $proc.ExitCode) {
         Write-Log "FAILED (exit $($proc.ExitCode)) after $($sw.Elapsed.ToString('hh\:mm\:ss')): $Exe" "ERROR"
         $tail | ForEach-Object { Write-Log $_ "ERROR" }
@@ -434,6 +435,12 @@ function Invoke-Configure {
                $(if ($bad) { $bad -join ', ' } else { "see $script:LogFile" }) +
                ". For zen5 this usually means the patch's declare_args() block is missing.")
     }
+    # Exit 1 is allowed above only so the unknown-argument case can be named.
+    # Any OTHER gn error (a missing toolchain file, a BUILD.gn syntax error) must
+    # stop here too: an earlier gen leaves build.ninja behind, so the check
+    # below would otherwise pass and configure would report success over a
+    # failed gen.
+    if ($script:LastCommandExitCode -ne 0) { throw "gn gen failed (exit $script:LastCommandExitCode); see $script:LogFile" }
     if (-not (Test-Path (Join-Path $OutDir "build.ninja"))) { throw "gn gen produced no build.ninja; see $script:LogFile" }
 
     # What the generated ninja was produced from. verify-source.ps1 compares

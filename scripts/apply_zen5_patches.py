@@ -415,6 +415,168 @@ def apply_edits(src_dir: Path, dry_run: bool = False):
     return [target], {"build/config/compiler/BUILD.gn": diff}
 
 
+# ---------------------------------------------------------------------------
+# V8: ship Wasm revectorization (128 -> 256-bit SIMD) on by default
+# ---------------------------------------------------------------------------
+# V8 15.4 compiles the Revec pass into every x64 build -- v8/BUILD.gn forces
+# v8_enable_wasm_simd256_revec = true there -- but leaves the runtime feature
+# `wasm_revectorize` in the STAGED list, i.e. default OFF, reachable only via
+# --js-flags=--wasm-revectorize. A launch switch is not good enough for this
+# project: links opened from other apps and protocol launches never carry it.
+#
+# So this moves the feature from STAGED to SHIPPED -- the same one-line move V8
+# makes when it ships a feature -- behind a GN arg that defaults to false, so
+# the baseline profile stays byte-for-byte stock Chromium.
+#
+# Runtime still gates it on AVX + AVX2 and on the module actually using SIMD
+# (v8/src/compiler/pipeline.cc), and --js-flags=--no-wasm-revectorize still
+# turns it off, so this is an emergency-reversible default, not a hard switch.
+#
+# The define is added in the SAME config block as V8_ENABLE_WASM_SIMD256_REVEC
+# so that every V8 translation unit sees identical flag defaults: FlagValues
+# is a header-defined struct, and a TU-dependent default would be an ODR
+# violation.
+#
+# Scope: affects only WebAssembly SIMD code. Plain JavaScript is unchanged.
+V8_MARKER = "thorium-zen5: ship wasm_revectorize"
+
+V8_EDITS = [
+    (
+        "v8/gni/v8.gni",
+        [
+            (
+                "insert_after",
+                "  v8_enable_wasm_simd256_revec = false\n",
+                "\n"
+                "  # --- " + V8_MARKER + " ---\n"
+                "  # Move V8's Wasm 128->256-bit SIMD revectorization from STAGED\n"
+                "  # (default off) to SHIPPED (default on). Added by thorium-zen5;\n"
+                "  # see scripts/apply_zen5_patches.py. false = stock behaviour.\n"
+                "  v8_zen5_ship_wasm_revec = false\n",
+            ),
+        ],
+    ),
+    (
+        "v8/BUILD.gn",
+        [
+            (
+                "insert_after",
+                "  if (v8_enable_wasm_simd256_revec) {\n"
+                "    defines += [ \"V8_ENABLE_WASM_SIMD256_REVEC\" ]\n"
+                "  }\n",
+                "  # --- " + V8_MARKER + " ---\n"
+                "  if (v8_enable_wasm_simd256_revec && v8_zen5_ship_wasm_revec) {\n"
+                "    defines += [ \"V8_ZEN5_SHIP_WASM_REVEC\" ]\n"
+                "  }\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/flags/feature-flags.h",
+        [
+            (
+                "insert_after",
+                "#endif  // V8_ENABLE_WASM_SIMD256_REVEC\n",
+                "\n"
+                "// --- " + V8_MARKER + " ---\n"
+                "// With V8_ZEN5_SHIP_WASM_REVEC, wasm_revectorize is listed as SHIPPED\n"
+                "// (default on) instead of STAGED. Otherwise stock behaviour.\n"
+                "#if defined(V8_ENABLE_WASM_SIMD256_REVEC) && \\\n"
+                "    defined(V8_ZEN5_SHIP_WASM_REVEC)\n"
+                "#define IF_REVEC_STAGED(then, feature_name, description)\n"
+                "#define IF_REVEC_SHIPPED(then, feature_name, description) \\\n"
+                "  then(feature_name, description)\n"
+                "#else\n"
+                "#define IF_REVEC_STAGED(then, feature_name, description) \\\n"
+                "  IF_REVEC_ENABLED(then, feature_name, description)\n"
+                "#define IF_REVEC_SHIPPED(then, feature_name, description)\n"
+                "#endif\n",
+            ),
+            (
+                "replace",
+                "  IF_REVEC_ENABLED(INTERNAL_FEATURE, wasm_revectorize,",
+                "  IF_REVEC_STAGED(INTERNAL_FEATURE, wasm_revectorize, ",
+            ),
+            (
+                "replace",
+                "                   \"ICs\")\n",
+                "                   \"ICs\")"
+                "                                                       \\\n"
+                "                                                                               \\\n"
+                "  /* " + V8_MARKER + " */                         \\\n"
+                "  IF_REVEC_SHIPPED(INTERNAL_FEATURE, wasm_revectorize,                        \\\n"
+                "                   \"128 to 256 bit SIMD re-vectorization for Wasm\")\n",
+            ),
+        ],
+    ),
+]
+
+
+def apply_v8_edits(src_dir: Path, dry_run: bool = False):
+    """Ship wasm_revectorize behind v8_zen5_ship_wasm_revec.
+
+    All-or-nothing: every anchor in every file is checked before anything is
+    written. Returns (changed_files, diffs). Exits 3 on a missing anchor or a
+    half-patched tree.
+    """
+    planned = []
+    marked = 0
+    for rel, edits in V8_EDITS:
+        path = src_dir / rel
+        if not path.exists():
+            print(f"ERROR: {path} does not exist.", file=sys.stderr)
+            sys.exit(3)
+        original = path.read_text(encoding="utf-8", errors="surrogateescape")
+        if V8_MARKER in original:
+            marked += 1
+            continue
+        text = original
+        for kind, anchor, new in edits:
+            n = text.count(anchor)
+            if n != 1:
+                print(
+                    f"ERROR: V8 revec anchor matched {n} times (expected 1) in "
+                    f"{rel}.\nAnchor was:\n{anchor!r}\n"
+                    "Upstream V8 changed shape. Nothing has been written.",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
+            if kind == "insert_after":
+                text = text.replace(anchor, anchor + new, 1)
+            else:
+                text = text.replace(anchor, new, 1)
+        if text.count("{") - text.count("}") != original.count("{") - original.count("}") \
+                or text.count("(") - text.count(")") != original.count("(") - original.count(")"):
+            print(f"ERROR: bracket balance changed in {rel} -- refusing to write.", file=sys.stderr)
+            sys.exit(3)
+        planned.append((rel, path, original, text))
+
+    if marked and planned:
+        print(
+            "ERROR: V8 revec patch is half-applied (marker present in some files, "
+            "absent in others). Restore the V8 files with git and re-run.",
+            file=sys.stderr,
+        )
+        sys.exit(3)
+    if not planned:
+        print("Already patched (marker present): V8 wasm_revectorize")
+        return [], {}
+
+    changed, diffs = [], {}
+    for rel, path, original, text in planned:
+        diffs[rel] = "\n".join(
+            difflib.unified_diff(
+                original.splitlines(), text.splitlines(),
+                fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm="",
+            )
+        )
+        if not dry_run:
+            path.write_text(text, encoding="utf-8", errors="surrogateescape", newline="\n")
+            print(f"Patched {path}")
+        changed.append(path)
+    return changed, diffs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--src-dir", required=True)
@@ -425,6 +587,9 @@ def main():
 
     src_dir = Path(args.src_dir)
     changed, diffs = apply_edits(src_dir, dry_run=args.dry_run)
+    v8_changed, v8_diffs = apply_v8_edits(src_dir, dry_run=args.dry_run)
+    changed += v8_changed
+    diffs.update(v8_diffs)
 
     if args.capture_diffs and args.patches_dir and diffs:
         pdir = Path(args.patches_dir)
