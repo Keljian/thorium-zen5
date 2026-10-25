@@ -118,6 +118,18 @@ One pipeline runs at a time (a named mutex); a second exits 11, and a build
 already running in the same out directory outside the pipeline also exits 11,
 with a toast.
 
+### Visual Studio and SDK updates
+
+Visual Studio updates itself in the background, and an update can uninstall
+and reinstall the Windows SDK. If that lands mid-build, headers vanish and the
+compile fails (2026-10-26, see `docs/HISTORY.md`). So before configure and
+before the build, the pipeline waits while Windows Installer or the Visual
+Studio Installer is running (up to 90 minutes, then it carries on). If the
+build still fails and the event log shows a Windows SDK or Visual Studio
+product was installed or removed while it ran, it says so in a toast,
+reconfigures, re-verifies and retries the build once. Any other build failure
+fails as before.
+
 ### Exit codes
 
 | code | meaning |

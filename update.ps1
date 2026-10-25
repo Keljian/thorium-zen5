@@ -230,13 +230,69 @@ if (Test-Stage "sync") {
 }
 Test-ClangRoll
 
-if (Test-Stage "configure") {
+# ---------------------------------------------------------------------------
+# Toolchain updates. On 2026-10-26 Visual Studio's own updater and this
+# pipeline both caught up at the same second after the PC woke; the updater
+# uninstalled the Windows SDK headers 21 minutes into the build and the build
+# died on a missing winsdkver.h. So: wait while an installer is running, and
+# if the SDK or Visual Studio changed during the build, reconfigure and retry
+# once rather than report a failure that was never the build's.
+# ---------------------------------------------------------------------------
+function Get-InstallerActivity {
+    $busy = @()
+    # Windows Installer holds this mutex for the length of any MSI install or
+    # removal, which covers the SDK. Opening it can be refused; refused still
+    # means it exists.
+    try {
+        $m = $null
+        if ([System.Threading.Mutex]::TryOpenExisting('Global\_MSIExecute', [ref]$m)) { $m.Dispose(); $busy += "Windows Installer" }
+    } catch [System.UnauthorizedAccessException] { $busy += "Windows Installer" } catch { }
+    $vs = @(Get-Process -Name vs_installer, vs_installershell, vs_setup_bootstrapper, BackgroundDownload -ErrorAction SilentlyContinue)
+    if ($vs) { $busy += "Visual Studio Installer ($((@($vs.Name) | Select-Object -Unique) -join ', '))" }
+    return $busy
+}
+
+function Wait-InstallerIdle([int]$MaxMinutes = 90) {
+    $deadline = (Get-Date).AddMinutes($MaxMinutes)
+    $said = $false
+    while ($true) {
+        $busy = @(Get-InstallerActivity)
+        if (-not $busy) {
+            if ($said) { Log "Installers finished; continuing." }
+            return
+        }
+        if ((Get-Date) -gt $deadline) {
+            Log "Still busy after $MaxMinutes min ($($busy -join ', ')); continuing anyway." "WARN"
+            return
+        }
+        if (-not $said) {
+            Log "Waiting for $($busy -join ', ') to finish before building: an update can change the SDK or compiler mid-build." "WARN"
+            $said = $true
+        }
+        Start-Sleep -Seconds 30
+    }
+}
+
+function Get-ToolchainChanges([datetime]$Since) {
+    # Products installed or removed (MsiInstaller 1033/1034) since $Since that
+    # belong to the Windows SDK or Visual Studio.
+    $ev = Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'MsiInstaller'; Id = 1033, 1034; StartTime = $Since } -ErrorAction SilentlyContinue
+    return @($ev | ForEach-Object {
+        if ($_.Message -match 'Product Name: (.+?)\. Product Version: (\d+(?:\.\d+)*)') {
+            $name = $Matches[1]; $ver = $Matches[2]
+            if ($name -match 'Windows SDK|Windows Software Development Kit|Visual Studio|Visual C\+\+') { "$name $ver" }
+        }
+    } | Select-Object -Unique)
+}
+
+function Invoke-Configure {
+    Wait-InstallerIdle
     Invoke-Stage "configure" -Params @{ Profile = $Profile } -FailExit 2 -FailMessage (
         "configure failed. If apply_zen5_patches.py exited 3, upstream Chromium moved the anchors the zen5 " +
         "patch inserts at (build/config/compiler/BUILD.gn); see patches/zen5/README.md. Nothing was built.")
 }
 
-if (Test-Stage "verify") {
+function Invoke-Verify {
     # A native powershell.exe, so $LASTEXITCODE is meaningful here.
     & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot "verify-source.ps1") -Profile $Profile
     if ($LASTEXITCODE -ne 0) {
@@ -245,8 +301,26 @@ if (Test-Stage "verify") {
     }
 }
 
+if (Test-Stage "configure") { Invoke-Configure }
+if (Test-Stage "verify")    { Invoke-Verify }
+
 if (Test-Stage "build") {
-    Invoke-Stage "build" -Params @{ Profile = $Profile } -FailMessage "build failed."
+    Wait-InstallerIdle
+    $buildStart = Get-Date
+    try {
+        & (Join-Path $RepoRoot "build.ps1") build -Profile $Profile
+    } catch {
+        $first = "$_"
+        $changed = @(Get-ToolchainChanges -Since $buildStart)
+        if (-not $changed) { Stop-Run 1 "build failed. Detail: $first" }
+        $msg = ("Visual Studio or the Windows SDK changed during the build ($((@($changed) | Select-Object -First 3) -join '; ')" +
+                $(if ($changed.Count -gt 3) { "; +$($changed.Count - 3) more" }) + "). Reconfiguring and retrying once.")
+        Log $msg "WARN"
+        $null = Show-ThoriumToast -Title "Chromium Zen 5 build retrying" -Body $msg
+        Invoke-Configure
+        Invoke-Verify
+        Invoke-Stage "build" -Params @{ Profile = $Profile } -FailMessage "build failed again on the retry after the toolchain update."
+    }
 }
 if (Test-Stage "test") {
     Invoke-Stage "test" -Params @{ Profile = $Profile } -FailMessage "tests failed; no release was produced."

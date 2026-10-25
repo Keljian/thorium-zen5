@@ -138,3 +138,14 @@ Audit findings fixed and the scripts shrunk:
   15.5.35.14 to 15.5.35.20, and mksnapshot runs with
   `--abort-on-bad-builtin-profile-data`. Configure now checks the V8
   profile against the V8 version (and revision) every time.
+
+## 2026-10-26
+
+- **Visual Studio updated itself mid-build.** The PC was off at 04:00, so
+  the nightly run and Visual Studio's BackgroundDownload task both started
+  at 07:53:04 on wake. Visual Studio 18.11.2 uninstalled the Windows SDK
+  10.0.28000 headers at 08:14:57 and reinstalled them at 08:22; the
+  157.0.8103.15 build failed at 08:15:29 on a missing `winsdkver.h`. The
+  pipeline now waits for running installers before configure and build, and
+  retries the build once if the event log shows the SDK or Visual Studio
+  changed during it.
