@@ -512,8 +512,221 @@ V8_EDITS = [
 ]
 
 
-def apply_v8_edits(src_dir: Path, dry_run: bool = False):
-    """Ship wasm_revectorize behind v8_zen5_ship_wasm_revec.
+# ---------------------------------------------------------------------------
+# V8: use the AVX10.1 Wasm SIMD paths on AVX-512 CPUs (Zen 4 / Zen 5)
+# ---------------------------------------------------------------------------
+# V8 has single-instruction EVEX forms for several Wasm SIMD operations
+# (i64x2.mul/abs/shr_s, i8x16.popcnt, v128/v256 select and not via
+# vpternlogd), compiled in with v8_enable_avx10_1 and used only when the CPU
+# enumerates AVX10.1 (CPUID leaf 0x24) AND --enable-avx10-1 is set. Zen 5
+# has every instruction those paths emit -- vpternlogd, vpabsq and vpsraq
+# (AVX512F+VL), vpmullq (AVX512DQ+VL), vpopcntb (AVX512_BITALG+VL) -- except
+# one: F16x8Add uses vaddph, which is AVX512-FP16, and Zen 5 has no FP16.
+#
+# So, behind v8_zen5_avx512_as_avx10 (default false):
+#   * base::CPU records AVX512 F+DQ+BW+VL+BITALG;
+#   * CpuFeatures marks AVX10_1 supported on such a CPU (with the same OS
+#     ZMM/opmask state check V8 uses for real AVX10);
+#   * --enable-avx10-1 defaults to true;
+#   * the three F16x8Add sites (TurboFan selector and code generator, and
+#     Liftoff) use the AVX10 form only on a CPU that really enumerates AVX10.
+#
+# Allocatable vector registers stay xmm0-14 either way (register-x64.h), so
+# nothing VEX-encoded is ever handed xmm16-31. The snapshot is unaffected:
+# mksnapshot takes features from compiler macros, and -march=znver5 does not
+# define __AVX10_1_512__. --no-enable-avx10-1 turns all of it off at runtime.
+#
+# The define lives in the same config block as V8_ENABLE_AVX10_1 so every V8
+# translation unit sees the same flag default (FlagValues is header-defined).
+V8_AVX10_MARKER = "thorium-zen5: AVX-512 as AVX10.1"
+
+V8_AVX10_EDITS = [
+    (
+        "v8/BUILD.gn",
+        [
+            (
+                "insert_after",
+                "  # Sets -DV8_ENABLE_AVX10_1.\n"
+                "  v8_enable_avx10_1 = false\n",
+                "\n"
+                "  # --- " + V8_AVX10_MARKER + " ---\n"
+                "  # Treat AVX512 F+DQ+BW+VL+BITALG as enough for V8's AVX10.1 Wasm\n"
+                "  # SIMD paths (Zen 4/5). Needs v8_enable_avx10_1. Added by\n"
+                "  # thorium-zen5; see scripts/apply_zen5_patches.py.\n"
+                "  v8_zen5_avx512_as_avx10 = false\n",
+            ),
+            (
+                "insert_after",
+                "  if (v8_enable_avx10_1) {\n"
+                "    defines += [ \"V8_ENABLE_AVX10_1\" ]\n"
+                "  }\n",
+                "  # --- " + V8_AVX10_MARKER + " ---\n"
+                "  if (v8_enable_avx10_1 && v8_zen5_avx512_as_avx10) {\n"
+                "    defines += [ \"V8_ZEN5_AVX512_AS_AVX10\" ]\n"
+                "  }\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/flags/flag-definitions.h",
+        [
+            (
+                "replace",
+                "DEFINE_BOOL(enable_avx10_1, false,\n"
+                "            \"enable use of AVX10.1 instructions if available\")\n",
+                "// --- " + V8_AVX10_MARKER + " ---\n"
+                "#if defined(V8_ZEN5_AVX512_AS_AVX10)\n"
+                "DEFINE_BOOL(enable_avx10_1, true,\n"
+                "            \"enable use of AVX10.1 instructions if available\")\n"
+                "#else\n"
+                "DEFINE_BOOL(enable_avx10_1, false,\n"
+                "            \"enable use of AVX10.1 instructions if available\")\n"
+                "#endif\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/base/cpu/cpu.h",
+        [
+            (
+                "insert_after",
+                "  bool has_avx10_1() const { return has_avx10_1_; }\n",
+                "  // --- " + V8_AVX10_MARKER + " ---\n"
+                "  bool has_avx512_for_avx10_path() const {\n"
+                "    return has_avx512_for_avx10_path_;\n"
+                "  }\n",
+            ),
+            (
+                "insert_after",
+                "  bool has_avx10_1_ = false;\n",
+                "  bool has_avx512_for_avx10_path_ = false;  // " + V8_AVX10_MARKER + "\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/base/cpu/cpu-x86.cc",
+        [
+            (
+                "insert_after",
+                "      DCHECK_IMPLIES(has_avx10_1_, (cpu_info24[1] & 0x70000) == 0x70000);\n"
+                "    }\n",
+                "    // --- " + V8_AVX10_MARKER + " ---\n"
+                "    // Every AVX-512 subset V8's AVX10.1 paths emit, except FP16.\n"
+                "    has_avx512_for_avx10_path_ =\n"
+                "        (cpu_info70[1] & 0x00010000) != 0 &&  // AVX512F\n"
+                "        (cpu_info70[1] & 0x00020000) != 0 &&  // AVX512DQ\n"
+                "        (cpu_info70[1] & 0x40000000) != 0 &&  // AVX512BW\n"
+                "        (static_cast<uint32_t>(cpu_info70[1]) & 0x80000000u) != 0 &&  // AVX512VL\n"
+                "        (cpu_info70[2] & 0x00001000) != 0;    // AVX512_BITALG\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/codegen/x64/assembler-x64.h",
+        [
+            (
+                "insert_after",
+                "#ifdef V8_ENABLE_AVX10_1\n"
+                "V8_EXPORT_PRIVATE bool UseAvx10_1();\n"
+                "#else\n"
+                "V8_EXPORT_PRIVATE inline bool UseAvx10_1() { return false; }\n"
+                "#endif\n",
+                "// --- " + V8_AVX10_MARKER + " ---\n"
+                "// AVX10.1 paths that also need AVX512-FP16, which an AVX-512 CPU\n"
+                "// accepted in place of AVX10 (Zen 4/5) does not have.\n"
+                "#if defined(V8_ZEN5_AVX512_AS_AVX10)\n"
+                "V8_EXPORT_PRIVATE bool UseAvx10_1Fp16();\n"
+                "#else\n"
+                "V8_EXPORT_PRIVATE inline bool UseAvx10_1Fp16() { return UseAvx10_1(); }\n"
+                "#endif\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/codegen/x64/assembler-x64.cc",
+        [
+            (
+                "insert_after",
+                "#ifdef V8_ENABLE_AVX10_1\n"
+                "bool UseAvx10_1() {\n"
+                "  return v8_flags.enable_avx10_1 && CpuFeatures::IsSupported(AVX10_1);\n"
+                "}\n"
+                "#endif\n",
+                "// --- " + V8_AVX10_MARKER + " ---\n"
+                "#if defined(V8_ZEN5_AVX512_AS_AVX10)\n"
+                "namespace {\n"
+                "bool zen5_cpu_has_real_avx10 = false;\n"
+                "}  // namespace\n"
+                "bool UseAvx10_1Fp16() { return UseAvx10_1() && zen5_cpu_has_real_avx10; }\n"
+                "#endif\n",
+            ),
+            (
+                "insert_after",
+                "  if (cpu.has_avx10_1() && cpu.has_osxsave() && OSHasAVX10Support()) {\n"
+                "    SetSupported(AVX10_1);\n"
+                "  }\n",
+                "#if defined(V8_ZEN5_AVX512_AS_AVX10)\n"
+                "  // --- " + V8_AVX10_MARKER + " ---\n"
+                "  zen5_cpu_has_real_avx10 = cpu.has_avx10_1();\n"
+                "  if (cpu.has_avx512_for_avx10_path() && cpu.has_osxsave() &&\n"
+                "      OSHasAVX10Support()) {\n"
+                "    SetSupported(AVX10_1);\n"
+                "  }\n"
+                "#endif\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/compiler/backend/x64/code-generator-x64.cc",
+        [
+            (
+                "replace",
+                "            // F16x8Add\n"
+                "            if (UseAvx10_1()) {\n",
+                "            // F16x8Add\n"
+                "            if (UseAvx10_1Fp16()) {  // " + V8_AVX10_MARKER + "\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/compiler/backend/x64/instruction-selector-x64.cc",
+        [
+            (
+                "replace",
+                "                         VectorLengthField::encode(VectorLength::kV128);\n"
+                "  if (UseAvx10_1()) {\n"
+                "    Emit(code, g.DefineAsRegister(node), g.UseRegister(op.left()),\n",
+                "                         VectorLengthField::encode(VectorLength::kV128);\n"
+                "  if (UseAvx10_1Fp16()) {  // " + V8_AVX10_MARKER + "\n"
+                "    Emit(code, g.DefineAsRegister(node), g.UseRegister(op.left()),\n",
+            ),
+        ],
+    ),
+    (
+        "v8/src/wasm/baseline/x64/liftoff-assembler-x64-inl.h",
+        [
+            (
+                "replace",
+                "bool LiftoffAssembler::emit_f16x8_add(LiftoffRegister dst, LiftoffRegister lhs,\n"
+                "                                      LiftoffRegister rhs) {\n"
+                "  if (UseAvx10_1()) {\n",
+                "bool LiftoffAssembler::emit_f16x8_add(LiftoffRegister dst, LiftoffRegister lhs,\n"
+                "                                      LiftoffRegister rhs) {\n"
+                "  if (UseAvx10_1Fp16()) {  // " + V8_AVX10_MARKER + "\n",
+            ),
+        ],
+    ),
+]
+
+V8_GROUPS = [
+    (V8_MARKER, V8_EDITS, "V8 wasm_revectorize"),
+    (V8_AVX10_MARKER, V8_AVX10_EDITS, "V8 AVX-512 as AVX10.1"),
+]
+
+
+def _apply_v8_group(src_dir: Path, marker: str, edits_by_file, label: str,
+                    dry_run: bool = False):
+    """Apply one group of V8 edits, identified by its marker.
 
     All-or-nothing: every anchor in every file is checked before anything is
     written. Returns (changed_files, diffs). Exits 3 on a missing anchor or a
@@ -521,13 +734,13 @@ def apply_v8_edits(src_dir: Path, dry_run: bool = False):
     """
     planned = []
     marked = 0
-    for rel, edits in V8_EDITS:
+    for rel, edits in edits_by_file:
         path = src_dir / rel
         if not path.exists():
             print(f"ERROR: {path} does not exist.", file=sys.stderr)
             sys.exit(3)
         original = path.read_text(encoding="utf-8", errors="surrogateescape")
-        if V8_MARKER in original:
+        if marker in original:
             marked += 1
             continue
         text = original
@@ -535,7 +748,7 @@ def apply_v8_edits(src_dir: Path, dry_run: bool = False):
             n = text.count(anchor)
             if n != 1:
                 print(
-                    f"ERROR: V8 revec anchor matched {n} times (expected 1) in "
+                    f"ERROR: {label} anchor matched {n} times (expected 1) in "
                     f"{rel}.\nAnchor was:\n{anchor!r}\n"
                     "Upstream V8 changed shape. Nothing has been written.",
                     file=sys.stderr,
@@ -553,13 +766,13 @@ def apply_v8_edits(src_dir: Path, dry_run: bool = False):
 
     if marked and planned:
         print(
-            "ERROR: V8 revec patch is half-applied (marker present in some files, "
+            f"ERROR: {label} patch is half-applied (marker present in some files, "
             "absent in others). Restore the V8 files with git and re-run.",
             file=sys.stderr,
         )
         sys.exit(3)
     if not planned:
-        print("Already patched (marker present): V8 wasm_revectorize")
+        print(f"Already patched (marker present): {label}")
         return [], {}
 
     changed, diffs = [], {}
@@ -574,6 +787,18 @@ def apply_v8_edits(src_dir: Path, dry_run: bool = False):
             path.write_text(text, encoding="utf-8", errors="surrogateescape", newline="\n")
             print(f"Patched {path}")
         changed.append(path)
+    return changed, diffs
+
+
+def apply_v8_edits(src_dir: Path, dry_run: bool = False):
+    """Every V8 edit group, in order. Groups may touch the same file; each is
+    idempotent on its own marker."""
+    changed, diffs = [], {}
+    for marker, edits_by_file, label in V8_GROUPS:
+        c, d = _apply_v8_group(src_dir, marker, edits_by_file, label, dry_run)
+        changed += [p for p in c if p not in changed]
+        for rel, diff in d.items():
+            diffs[rel] = (diffs[rel] + "\n" + diff) if rel in diffs else diff
     return changed, diffs
 
 

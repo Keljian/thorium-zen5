@@ -182,3 +182,25 @@ zen5_slp_max_reg_size = "256"
 # runtime on AVX2 and on the module using SIMD, and still switchable off with
 # --js-flags=--no-wasm-revectorize.
 v8_zen5_ship_wasm_revec = true
+
+# V8'S AVX10.1 WASM SIMD PATHS ON AVX-512
+# ---------------------------------------
+# V8 has single-instruction EVEX forms for i64x2.mul/abs/shr_s, i8x16.popcnt
+# and v128/v256 select/not, used only on CPUs that enumerate AVX10.1. Zen 5
+# has every instruction involved except AVX512-FP16, which only the
+# F16x8Add path needs and which stays on its fallback here.
+# v8_enable_avx10_1 is V8's own arg (compiles the paths in);
+# v8_zen5_avx512_as_avx10 is ours (apply_zen5_patches.py) and lets an
+# AVX512 F+DQ+BW+VL+BITALG CPU use them. WebAssembly SIMD only.
+# --js-flags=--no-enable-avx10-1 turns it off at runtime.
+v8_enable_avx10_1 = true
+v8_zen5_avx512_as_avx10 = true
+
+# ZLIB'S AVX-512 CRC-32
+# ---------------------
+# Chromium's zlib carries a VPCLMULQDQ/AVX-512 CRC-32 (crc32_simd.c) with its
+# own runtime check, but its BUILD.gn only enables the SSE4.2 version. This
+# define turns the AVX-512 one on; buffers of 256 bytes or more use it, the
+# rest falls through to SSE4.2. It mostly affects gzip data. Passed through
+# zen5_extra_target_cflags so no zlib file is edited.
+zen5_extra_target_cflags = [ "/DCRC32_SIMD_AVX512_PCLMUL" ]
