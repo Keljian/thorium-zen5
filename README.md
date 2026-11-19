@@ -43,8 +43,8 @@ Then:
    depot_tools inside it:
 
    ```powershell
-   git clone https://github.com/Keljian/thorium-zen5.git C:\thorium
-   cd C:\thorium
+   git clone https://github.com/Keljian/thorium-zen5.git D:\thorium
+   cd D:\thorium
    git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git depot_tools
    ```
 
@@ -126,8 +126,8 @@ pass:
 |---|---|
 | `cxx_march` / `cxx_mtune` | `-march=znver5 -mtune=znver5` on the C++ compile |
 | `rust_cpu` | `-Ctarget-cpu=znver5` on the Rust compile |
-| `tail_merge_workaround` | `-mllvm:-enable-tail-merge=false` on the chrome.dll link |
-| `slp_cap_workaround` | `-mllvm:-slp-max-reg-size=256` on the chrome.dll link |
+| `tail_merge_workaround` | `-mllvm:-enable-tail-merge=false` on the chrome.dll link exactly when `args.gn` asks for it (retired 2026-11-19) |
+| `slp_cap_workaround` | `-mllvm:-slp-max-reg-size=` on the chrome.dll link exactly when `args.gn` asks for it (retired 2026-11-19) |
 
 This section exists because every real failure on this project has been the
 same shape: a flag that was declared but never applied, and therefore
@@ -229,9 +229,11 @@ every install (version, and chrome.dll hash where the release records one).
 
 ### Open items, stated rather than skipped
 
-- **Two** toolchain workarounds are in force (tail-merge off, SLP capped at
-  256 bits). The third, the `-mllvm:-march=` backend flag, was measured to be
-  a no-op and is now off (`zen5_lto_backend_march = false`). See
+- **No** toolchain workaround is in force. The two that were (tail-merge off,
+  SLP capped at 256 bits) were retired on 2026-11-19 when clang
+  llvmorg-24-init-17044 stopped needing them; `.\build.ps1 canary` re-tests
+  them after each clang roll. The `-mllvm:-march=` backend flag was measured
+  to be a no-op and is off (`zen5_lto_backend_march = false`). See
   `docs/TOOLCHAIN-BUGS.md` and `patches/zen5/README.md`.
 - The shipped binary carries two LTO knobs that are **unmeasured**:
   `-mllvm:-import-instr-limit=100` and `/opt:lldlto=3`. Plausible wins, not

@@ -149,3 +149,35 @@ Audit findings fixed and the scripts shrunk:
   pipeline now waits for running installers before configure and build, and
   retries the build once if the event log shows the SDK or Visual Studio
   changed during it.
+
+## 2026-11-13
+
+- **The analyze stage deleted clang after every build.** gclient fetches
+  clang into `third_party\llvm-build\Release+Asserts` and marks the
+  directory with `.*_is_first_class_gcs` files. `update.py --package=objdump`
+  deletes any directory carrying those markers before unpacking, so each
+  analyze left only the objdump tools there and `gn` could not run until the
+  next sync downloaded clang again, which removed objdump, and so on every
+  build since 2026-09-27. Nightly runs never noticed because they start at
+  sync; `-FromStage configure` or `build` would have failed. objdump now goes
+  to `build\llvm-objdump` (`--output-dir`), and the clang directory is left
+  to gclient.
+
+## 2026-11-19
+
+- **The desktop icon still pointed at C:\thorium** after the repo moved to
+  D: on 2026-11-16, so clicking it opened a window that failed at once.
+  `Set-UpdateShortcut` only created a missing icon and kept any existing one.
+  It now repoints an icon whose arguments or working folder name another
+  location.
+- **Both toolchain workarounds retired.** clang rolled to
+  llvmorg-24-init-17044-gc3223914 with Chromium 159.0.8154.13. The new
+  `build.ps1 canary` found the SLP abort gone (SkPathRawShapes.cpp compiles
+  uncapped, with 512-bit SLP code in it) and root_store_tool linking cleanly
+  without the tail-merge ldflag, without the SLP cap and without either,
+  cold ThinLTO cache each time. Both are off in `gn/win_zen5_args.gn`.
+  `verify-source.ps1` now expects each one exactly when `args.gn` asks for
+  it, instead of warning whenever one is missing.
+- **configure clears the ThinLTO cache when args.gn changes.** `-mllvm`
+  flags are not in its key, so retiring a workaround and relinking would
+  have reused the old codegen and shipped an unchanged chrome.dll.

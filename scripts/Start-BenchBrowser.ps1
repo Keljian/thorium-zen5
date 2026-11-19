@@ -42,7 +42,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$root         = 'C:\thorium'
+$root         = 'D:\thorium'
 $outBase      = Join-Path $root 'src\out\thorium-baseline\chrome.exe'
 $outZen5      = Join-Path $root 'src\out\thorium-zen5\chrome.exe'
 # The canonical install. This pointed at %USERPROFILE%\ThoriumZen5\Application

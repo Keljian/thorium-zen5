@@ -97,9 +97,10 @@ if (-not (Test-Path $argsGn)) {
         if ($l -match '^\s*([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$') { $flags[$Matches[1]] = $Matches[2] }
     }
     $result.gn_args = $flags
-    # zen5_mtune is znver5 on purpose: the tail-merge ldflag works around the
-    # znver* ThinLTO miscompile (llvm#199290). If that ldflag is retired,
-    # this must change in the same commit. See gn/win_zen5_args.gn.
+    # zen5_mtune is znver5 on purpose. The znver* ThinLTO miscompile
+    # (llvm#199290) is gone on the current clang; on one that has it, the
+    # tail-merge ldflag goes back rather than this changing. See
+    # gn/win_zen5_args.gn.
     $expect = if ($Profile -eq "zen5") {
         @{ use_znver5 = "true"; use_generic_avx512 = "false"; target_cpu = '"x64"'; zen5_march = '"znver5"'; zen5_mtune = '"znver5"' }
     } else {
@@ -136,7 +137,16 @@ if (-not (Test-Path $tn)) {
             if (-not $text.Contains($c[1])) { Add-Err "'$($c[1])' is not in toolchain.ninja: the GN arg is set but the flag is not emitted." }
         }
         # Both workarounds run in the ThinLTO backend, so they are ldflags and
-        # never appear in toolchain.ninja; check the chrome.dll link line.
+        # never appear in toolchain.ninja; check the chrome.dll link line. Each
+        # is expected exactly when args.gn asks for it: both are retired on
+        # the current clang, and `.\build.ps1 canary` says whether a roll
+        # needs one back.
+        $argsText = if (Test-Path $argsGn) { (Get-Content $argsGn | Where-Object { $_ -notmatch '^\s*#' }) -join "`n" } else { "" }
+        $slpArg = [string]$flags["zen5_slp_max_reg_size"]
+        $wanted = @{
+            tail_merge_workaround = $argsText.Contains("enable-tail-merge=false")
+            slp_cap_workaround    = ($slpArg -and $slpArg -ne '""')
+        }
         $dllNinja = Join-Path $OutDir "obj\chrome\chrome_dll.ninja"
         $ld = if (Test-Path $dllNinja) { (Select-String -Path $dllNinja -Pattern '^\s*ldflags\s*=' | Select-Object -First 1).Line } else { $null }
         if (-not $ld) {
@@ -144,8 +154,10 @@ if (-not (Test-Path $tn)) {
         } else {
             foreach ($w in @(@("tail_merge_workaround", "enable-tail-merge=false"), @("slp_cap_workaround", "slp-max-reg-size="))) {
                 $result.emitted_flags[$w[0]] = $ld.Contains($w[1])
-                if (-not $ld.Contains($w[1])) {
-                    Add-Warn "'$($w[1])' is not on the chrome.dll link line. Correct only if the toolchain bug is fixed and the knob retired; otherwise the link will fail."
+                if ($wanted[$w[0]] -and -not $ld.Contains($w[1])) {
+                    Add-Err "args.gn sets the $($w[0]) but '$($w[1])' is not on the chrome.dll link line."
+                } elseif (-not $wanted[$w[0]] -and $ld.Contains($w[1])) {
+                    Add-Warn "'$($w[1])' is on the chrome.dll link line but args.gn does not ask for it."
                 }
             }
         }

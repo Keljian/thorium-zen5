@@ -3,7 +3,7 @@
 ## Layout
 
 ```
-C:\thorium\                    (repo root)
+D:\thorium\                    (repo root)
   build.ps1                    stages: sync/configure/build/test/analyze/package/publish
   update.ps1                   nightly pipeline: runs the stages, publishes, deploys
   verify-source.ps1            proves the targeting reached the generated ninja

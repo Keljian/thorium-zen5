@@ -12,7 +12,7 @@ skipped or estimated -- per the project's "do not claim performance
 improvements without measurement" requirement.
 
 Usage:
-    python3 scripts/compare_builds.py --repo-root C:\\thorium \
+    python3 scripts/compare_builds.py --repo-root D:\\thorium \
         --profiles baseline zen5 generic-avx512 \
         --out-json build/compare-report.json --out-txt build/compare-report.txt
 """
@@ -82,7 +82,7 @@ def collect(repo_root: Path, profile: str, build_root: Path) -> dict:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo-root", default=r"C:\thorium")
+    ap.add_argument("--repo-root", default=r"D:\thorium")
     ap.add_argument("--build-root", default=None, help="defaults to <repo-root>/build")
     ap.add_argument("--profiles", nargs="+", default=["baseline", "zen5"])
     ap.add_argument("--out-json", default=None)

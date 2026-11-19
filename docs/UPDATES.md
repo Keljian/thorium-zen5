@@ -153,9 +153,10 @@ upstream changes". The diff of each fresh application is saved under
 
 ## Clang rolls
 
-The two toolchain workarounds in `gn/win_zen5_args.gn` are pinned to a clang
-revision. When `tools/clang/scripts/update.py` rolls, the log says so and asks
-for a re-test with the `root_store_tool` canary. See `docs/TOOLCHAIN-BUGS.md`.
+The two toolchain workarounds in `gn/win_zen5_args.gn` (both retired on
+2026-11-19) are tied to a clang revision. When `tools/clang/scripts/update.py`
+rolls, the log says so and asks for `.\build.ps1 canary`, which tells you
+whether either is needed again. See `docs/TOOLCHAIN-BUGS.md`.
 
 ## Publishing
 

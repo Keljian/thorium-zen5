@@ -108,7 +108,7 @@ def run_one(py, driver, exe, label, port, url, out_json, timeout):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo-root", default=r"C:\thorium")
+    ap.add_argument("--repo-root", default=r"D:\thorium")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument("--pairs", type=int, default=5)
     ap.add_argument("--url", default="https://browserbench.org/Speedometer3.1/")

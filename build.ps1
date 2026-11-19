@@ -14,6 +14,11 @@
         package    copy mini_installer + manifest + ISA report into releases\
         publish    upload the newest release to GitHub Releases (private repo)
 
+    Not a pipeline stage:
+
+        canary     re-test the toolchain workarounds in gn\win_zen5_args.gn
+                   against the current clang; results in build\toolchain-canary.json
+
     See docs/BUILD.md. Incident history behind the odd-looking parts is in
     docs/HISTORY.md.
 
@@ -25,6 +30,7 @@
     Build only these ninja targets. root_store_tool links base under ThinLTO
     in about two minutes, which is the fast loop for toolchain problems
     (docs/TOOLCHAIN-BUGS.md). No manifest is written for a partial build.
+    canary links root_store_tool unless -Target says otherwise.
 
 .PARAMETER Priority
     Priority class for everything the build spawns. BelowNormal keeps the
@@ -33,11 +39,12 @@
 .EXAMPLE
     .\build.ps1 configure -Profile zen5 -Force
     .\build.ps1 build -Profile zen5 -Target root_store_tool
+    .\build.ps1 canary
 #>
 [CmdletBinding()]
 param(
     [Parameter(Position = 0, Mandatory = $true)]
-    [ValidateSet("sync", "configure", "build", "test", "analyze", "package", "publish")]
+    [ValidateSet("sync", "configure", "build", "test", "analyze", "package", "publish", "canary")]
     [string]$Command,
 
     [ValidateSet("baseline", "zen5")]
@@ -388,6 +395,15 @@ function Get-PgoProfile {
     return $got.FullName
 }
 
+function Get-ArgsText {
+    # Shared block concatenated, so the profiles differ only in CPU targeting.
+    # String.Replace, not -replace: a '$' in the path would be a regex token.
+    $pgo = (Get-PgoProfile) -replace '\\', '/'
+    $common = Get-Content (Join-Path $GnDir "_common_args.gni.txt") -Raw
+    $own = Get-Content (Join-Path $GnDir "win_${Profile}_args.gn") -Raw
+    return ($common + "`n" + $own).Replace('__PGO_DATA_PATH__', $pgo)
+}
+
 function Invoke-Configure {
     Start-Log "configure"
     Assert-Prereqs
@@ -409,16 +425,23 @@ function Invoke-Configure {
             "--src-dir", $SrcDir, "--capture-diffs", "--patches-dir", (Join-Path $BuildDir "patch-capture"))
     }
 
-    $pgo = (Get-PgoProfile) -replace '\\', '/'
     $argsSrc = Join-Path $GnDir "win_${Profile}_args.gn"
     $commonSrc = Join-Path $GnDir "_common_args.gni.txt"
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-    # Shared block concatenated, so the profiles differ only in CPU targeting.
-    # String.Replace, not -replace: a '$' in the path would be a regex token.
-    $argsText = ((Get-Content $commonSrc -Raw) + "`n" + (Get-Content $argsSrc -Raw)).Replace('__PGO_DATA_PATH__', $pgo)
+    $argsText = Get-ArgsText
     $argsGn = Join-Path $OutDir "args.gn"
+    $oldArgs = if (Test-Path $argsGn) { Get-Content $argsGn -Raw } else { $null }
     Set-Content -Path $argsGn -Value $argsText -NoNewline
     Write-Log "Wrote $argsGn from $commonSrc + $argsSrc"
+    # -mllvm flags are not part of the ThinLTO cache key, so after an args
+    # change (a workaround retired, a flag added) the link would reuse the old
+    # codegen and look unchanged. Any change clears it: a Chromium roll moves
+    # the PGO path anyway, and the cache only pays off relinking the same tree.
+    $ltoCache = Join-Path $OutDir "thinlto-cache"
+    if ($null -ne $oldArgs -and $oldArgs -ne $argsText -and (Test-Path $ltoCache)) {
+        Remove-Item -LiteralPath $ltoCache -Recurse -Force
+        Write-Log "args.gn changed: cleared $ltoCache (-mllvm flags are not in the ThinLTO cache key)."
+    }
 
     Invoke-Logged -Exe (Join-Path $DepotTools "gn.bat") -Arguments @("gen", $OutRel) `
         -WorkingDirectory $SrcDir -EnvVars (Get-DepotToolsEnv) -AllowedExitCodes @(0, 1)
@@ -502,16 +525,21 @@ function Invoke-Analyze {
     $binary = Join-Path $OutDir "chrome.dll"
     if (-not (Test-Path $binary)) { throw "No chrome.dll in $OutDir. Build first." }
 
-    # Chromium's clang package omits llvm-objdump, and a clang roll deletes the
-    # separately fetched one, so fetch it whenever it is missing.
+    # Chromium's clang package omits llvm-objdump, so it is fetched separately,
+    # into build\llvm-objdump and NOT into the clang directory. gclient owns
+    # third_party\llvm-build\Release+Asserts and marks it with
+    # .*_is_first_class_gcs files; update.py deletes any directory carrying
+    # those markers before unpacking into it. Fetching objdump there removed
+    # clang-cl after every build and left the tree unable to run gn until the
+    # next sync downloaded clang again (which in turn removed objdump).
+    # update.py is called every time: it returns at once when the stamp in
+    # build\llvm-objdump matches the pinned clang, and refetches after a roll.
     $bin = Join-Path $SrcDir "third_party\llvm-build\Release+Asserts\bin"
-    $objdump = Join-Path $bin "llvm-objdump.exe"
-    if (-not (Test-Path $objdump)) {
-        Write-Log "Fetching llvm-objdump matched to the pinned clang."
-        Invoke-Logged -Exe (Get-PythonExe) -Arguments @((Join-Path $SrcDir "tools\clang\scripts\update.py"), "--package=objdump") `
-            -WorkingDirectory $SrcDir -EnvVars (Get-DepotToolsEnv)
-        if (-not (Test-Path $objdump)) { throw "llvm-objdump still missing at $objdump." }
-    }
+    $objdumpDir = Join-Path $BuildDir "llvm-objdump"
+    $objdump = Join-Path $objdumpDir "bin\llvm-objdump.exe"
+    Invoke-Logged -Exe (Get-PythonExe) -Arguments @((Join-Path $SrcDir "tools\clang\scripts\update.py"),
+        "--package=objdump", "--output-dir", $objdumpDir) -WorkingDirectory $SrcDir -EnvVars (Get-DepotToolsEnv)
+    if (-not (Test-Path $objdump)) { throw "llvm-objdump missing at $objdump." }
     $a = @((Join-Path $ScriptsDir "analyze_isa.py"), "--binary", $binary, "--objdump", $objdump,
            "--symbolizer", (Join-Path $bin "llvm-symbolizer.exe"), "--label", $Profile,
            "--out-json", (Join-Path $BuildDir "isa-report-$Profile.json"),
@@ -607,6 +635,155 @@ $isa
 }
 
 # ---------------------------------------------------------------------------
+# canary: re-test the toolchain workarounds (docs/TOOLCHAIN-BUGS.md)
+# ---------------------------------------------------------------------------
+function Get-ClangRevision {
+    $upd = Join-Path $SrcDir "tools\clang\scripts\update.py"
+    $m = if (Test-Path $upd) { Select-String -Path $upd -Pattern "^CLANG_REVISION = '([^']+)'" | Select-Object -First 1 }
+    if ($m) { return $m.Matches[0].Groups[1].Value }
+    return $null
+}
+
+function Invoke-SlpProbe {
+    <#
+    The SLP cap works around an X86 instruction-selection abort in one Skia
+    function, so the direct test is that one file: its compile command from
+    the configured build, minus the ThinLTO flags so the backend runs in the
+    compiler instead of at link, once with the cap and once without. Seconds.
+    #>
+    $obj = "obj/skia/skia_core_and_effects/SkPathRawShapes.obj"
+    $ninja = Join-Path $SrcDir "third_party\ninja\ninja.exe"
+    $r = Invoke-NativeCapture -Exe $ninja -Arguments @("-C", $OutRel, "-t", "commands", "-s", $obj) -WorkingDirectory $SrcDir
+    $line = @($r.Output -split "`n" | Where-Object { $_ -match 'clang-cl\.exe' }) | Select-Object -Last 1
+    if ($r.ExitCode -ne 0 -or $line -notmatch '^\s*(\S+clang-cl\.exe)\s+(.*)$') {
+        Write-Log "No compile command for $obj in $OutRel; SLP probe skipped." "WARN"
+        return [ordered]@{ status = "SKIPPED" }
+    }
+    $clang = [IO.Path]::GetFullPath((Join-Path $OutDir $Matches[1]))
+    $rest = $Matches[2]
+    foreach ($f in '-flto=thin', '-fwhole-program-vtables', '-fsplit-lto-unit', '/showIncludes\S*', '/Fo\S+') {
+        $rest = $rest -replace "(?<=^|\s)$f(?=\s|$)", ''
+    }
+    $objdump = Join-Path $BuildDir "llvm-objdump\bin\llvm-objdump.exe"
+    $res = [ordered]@{ file = "third_party/skia/src/core/SkPathRawShapes.cpp" }
+    foreach ($v in @(@("capped", "-mllvm -slp-max-reg-size=256"), @("uncapped", ""))) {
+        $o = Join-Path $env:TEMP "thorium-slp-probe-$($v[0]).obj"
+        $rsp = "$o.rsp"
+        Remove-Item $o, $rsp -ErrorAction SilentlyContinue
+        Set-Content -Path $rsp -Value "$($v[1]) $rest `"/Fo$o`"" -Encoding ASCII
+        $c = Invoke-NativeCapture -Exe $clang -Arguments @("@$rsp") -WorkingDirectory $OutDir
+        $abort = $c.Output -match 'Cannot select'
+        # zmm lines show whether SLP actually went 512-bit when uncapped.
+        $zmm = $null
+        if ($c.ExitCode -eq 0 -and (Test-Path $objdump) -and (Test-Path $o)) {
+            $d = Invoke-NativeCapture -Exe $objdump -Arguments @("-d", "--no-show-raw-insn", $o)
+            $zmm = @($d.Output -split "`n" | Where-Object { $_ -match 'zmm' }).Count
+        }
+        $res[$v[0]] = [ordered]@{ exit = $c.ExitCode; isel_abort = $abort; zmm_lines = $zmm }
+        Write-Log ("SLP probe, $($v[0]): exit $($c.ExitCode)" + $(if ($abort) { ", Cannot select" }) + $(if ($null -ne $zmm) { ", $zmm zmm lines" }))
+        if ($c.ExitCode -ne 0) { $c.Output -split "`n" | Select-Object -First 5 | ForEach-Object { Write-Log "  $_" "WARN" } }
+        Remove-Item $o, $rsp -ErrorAction SilentlyContinue
+    }
+    $res.status = if ($res.capped.exit -ne 0) { "INVALID" }
+                  elseif ($res.uncapped.isel_abort) { "STILL_BROKEN" }
+                  elseif ($res.uncapped.exit -eq 0) { "FIXED" }
+                  else { "OTHER_FAILURE" }
+    return $res
+}
+
+function Invoke-Canary {
+    <#
+    Is each workaround in gn\win_zen5_args.gn still needed on this clang?
+      1. SLP compile probe (above).
+      2. Link canary: root_store_tool links base under ThinLTO + PGO + WPD,
+         which is where the tail-merge miscompile shows. Four variants of
+         args.gn, in out\thorium-zen5-canary so the real build is untouched.
+         Each clears the ThinLTO cache (-mllvm flags are not in its key) and
+         deletes the binary, so every variant really relinks.
+    Both bugs are hard compile or link errors, never silent, so PASS here plus
+    a full chrome build that links is enough to retire a workaround.
+    #>
+    Start-Log "canary"
+    if ($Profile -ne "zen5") { throw "The workarounds are zen5 args; run canary with -Profile zen5." }
+    if (-not (Test-Path (Join-Path $OutDir "build.ninja"))) { throw "'$Profile' is not configured. Run '.\build.ps1 configure -Profile $Profile'." }
+    $clangRev = Get-ClangRevision
+    Write-Log "Toolchain canary, clang $clangRev, Chromium $(Get-PinnedChromiumTag)."
+    $result = [ordered]@{
+        clang_revision = $clangRev
+        chromium_tag   = Get-PinnedChromiumTag
+        started_utc    = (Get-Date).ToUniversalTime().ToString("o")
+    }
+    $result.slp_compile_probe = Invoke-SlpProbe
+
+    $tgt = if ($Target.Count -gt 0) { $Target } else { @("root_store_tool") }
+    $canRel = "$OutRel-canary"
+    $canDir = Join-Path $SrcDir $canRel
+    New-Item -ItemType Directory -Force -Path $canDir | Out-Null
+    $base = Get-ArgsText
+    # Not on a comment line: the args file quotes the flag in its own notes.
+    $tm  = '(?m)^([^#\r\n]*?)"-mllvm:-enable-tail-merge=false"\s*,?[ \t]*'
+    $slp = '(?m)^(\s*)zen5_slp_max_reg_size\s*=\s*"[^"]*"'
+    foreach ($pat in $tm, $slp) {
+        $k = ([regex]::Matches($base, $pat)).Count
+        if ($k -gt 1) { throw "args pattern $pat matches $k times; the canary cannot tell which to remove." }
+    }
+    $variants = [ordered]@{
+        "as-configured"      = $base
+        "without-tail-merge" = $base -replace $tm, '$1'
+        "without-slp-cap"    = $base -replace $slp, '$1zen5_slp_max_reg_size = ""'
+        "without-either"     = ($base -replace $tm, '$1') -replace $slp, '$1zen5_slp_max_reg_size = ""'
+    }
+    $toolEnv = Get-DepotToolsEnv
+    $jobs = Get-JobCount
+    $ran = @{}
+    $out = [ordered]@{}
+    foreach ($name in $variants.Keys) {
+        $text = $variants[$name]
+        if ($ran.ContainsKey($text)) {
+            $same = $ran[$text]
+            $out[$name] = [ordered]@{ status = $out[$same].status; same_as = $same }
+            Write-Log "Variant '$name' is identical to '$same' (that workaround is not set)."
+            continue
+        }
+        $ran[$text] = $name
+        Write-Log "Link canary variant '$name' ($($tgt -join ' '), $jobs jobs)."
+        Set-Content -Path (Join-Path $canDir "args.gn") -Value $text -NoNewline
+        Remove-Item -LiteralPath (Join-Path $canDir "thinlto-cache") -Recurse -Force -ErrorAction SilentlyContinue
+        foreach ($t in $tgt) { Remove-Item -LiteralPath (Join-Path $canDir "$t.exe") -Force -ErrorAction SilentlyContinue }
+        Invoke-Logged -Exe (Join-Path $DepotTools "gn.bat") -Arguments @("gen", $canRel) -WorkingDirectory $SrcDir -EnvVars $toolEnv
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        Invoke-Logged -Exe (Join-Path $DepotTools "autoninja.bat") -Arguments (@("-C", $canRel) + $tgt + "-j$jobs") `
+            -WorkingDirectory $SrcDir -EnvVars $toolEnv -AllowedExitCodes @(0, 1)
+        $tail = $script:LastCommandTail
+        $status = if ($script:LastCommandExitCode -eq 0) { "PASS" }
+                  elseif ($tail -match 'Cannot select') { "FAIL_SLP_ISEL" }
+                  elseif ($tail -match 'seh_endepilogue|vector deleting dtor') { "FAIL_TAIL_MERGE" }
+                  else { "FAIL_OTHER" }
+        $out[$name] = [ordered]@{ status = $status; seconds = [int]$sw.Elapsed.TotalSeconds }
+        Write-Log "Variant '$name': $status ($([int]$sw.Elapsed.TotalSeconds)s)." $(if ($status -eq "PASS") { "INFO" } else { "WARN" })
+    }
+    $result.link_canary = [ordered]@{ target = ($tgt -join ' '); out_dir = $canRel; variants = $out }
+
+    $verdict = [ordered]@{}
+    if ($out["as-configured"].status -ne "PASS") {
+        $verdict.overall = "INVALID: the as-configured link failed ($($out['as-configured'].status)), so the other variants mean nothing. See $script:LogFile"
+    } else {
+        $verdict.tail_merge_ldflag = if ($out["without-tail-merge"].status -eq "PASS") { "not needed on this canary" } else { "still needed ($($out['without-tail-merge'].status))" }
+        $probe = $result.slp_compile_probe.status
+        $verdict.slp_cap = if ($probe -eq "FIXED" -and $out["without-slp-cap"].status -eq "PASS") { "not needed (compile probe and link canary pass)" }
+                           elseif ($probe -eq "STILL_BROKEN" -or $out["without-slp-cap"].status -eq "FAIL_SLP_ISEL") { "still needed" }
+                           else { "inconclusive (probe $probe, link $($out['without-slp-cap'].status))" }
+        $verdict.both_off = $out["without-either"].status
+        $verdict.note = "root_store_tool does not contain the Skia code; a full chrome build that links is the last word."
+    }
+    $result.verdict = $verdict
+    $result.finished_utc = (Get-Date).ToUniversalTime().ToString("o")
+    $json = Join-Path $BuildDir "toolchain-canary.json"
+    $result | ConvertTo-Json -Depth 6 | Set-Content -Path $json -Encoding ASCII
+    foreach ($k in $verdict.Keys) { Write-Log "Verdict, ${k}: $($verdict[$k])" }
+    Write-Log "Canary results: $json"
+}
+# ---------------------------------------------------------------------------
 try {
     switch ($Command) {
         "sync"      { Invoke-Sync }
@@ -616,6 +793,7 @@ try {
         "analyze"   { Invoke-Analyze }
         "package"   { Invoke-Package }
         "publish"   { Invoke-Publish }
+        "canary"    { Invoke-Canary }
     }
 } finally {
     Close-LogFile

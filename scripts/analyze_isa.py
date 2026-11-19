@@ -6,9 +6,9 @@ compiler emitted AVX-512 just because -march=znver5/use_generic_avx512 was passe
 it inspects the real machine code with llvm-objdump.
 
 Usage:
-    python3 scripts/analyze_isa.py --binary C:\\thorium\\src\\out\\thorium\\chrome.dll \
-        --objdump C:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\llvm-objdump.exe \
-        --pdb C:\\thorium\\src\\out\\thorium\\chrome.dll.pdb \
+    python3 scripts/analyze_isa.py --binary D:\\thorium\\src\\out\\thorium\\chrome.dll \
+        --objdump D:\\thorium\\src\\third_party\\llvm-build\\Release+Asserts\\bin\\llvm-objdump.exe \
+        --pdb D:\\thorium\\src\\out\\thorium\\chrome.dll.pdb \
         --out-json build/isa-report.json --out-txt build/isa-report.txt
 
 Notes / honesty about limitations:

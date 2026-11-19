@@ -13,10 +13,10 @@ For a real web-application-responsiveness score, download
 static site with its own license -- this project does not vendor it):
 
 ```powershell
-git clone https://github.com/WebKit/Speedometer.git C:\thorium\benchmarks\speedometer
+git clone https://github.com/WebKit/Speedometer.git D:\thorium\benchmarks\speedometer
 ```
 
-Then pass `-SpeedometerDir C:\thorium\benchmarks\speedometer\.build` (or
+Then pass `-SpeedometerDir D:\thorium\benchmarks\speedometer\.build` (or
 wherever `index.html` ends up after Speedometer's own build step -- see its
 README) to `build.ps1 benchmark`. If the directory or `index.html` isn't
 found, `scripts/benchmark.py` records `"skipped"` with the reason rather
@@ -27,7 +27,7 @@ than fabricating a score.
 After benchmarking two or more profiles, run:
 
 ```powershell
-python3 scripts\compare_builds.py --repo-root C:\thorium --profiles baseline zen5 generic-avx512
+python3 scripts\compare_builds.py --repo-root D:\thorium --profiles baseline zen5 generic-avx512
 ```
 
 which reads each profile's `build/benchmark-<profile>.json`,

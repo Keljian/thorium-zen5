@@ -16,7 +16,7 @@ Run `scripts\Test-Prerequisites.ps1` to check all of these at once.
 - Git for Windows and Python 3 (from python.org, not the Microsoft Store
   alias), both on `PATH`.
 - `depot_tools` cloned inside the repo:
-  `git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git C:\thorium\depot_tools`
+  `git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git D:\thorium\depot_tools`
 - Optional: the GitHub CLI (`gh auth login`) for publishing releases.
   Without it, publishing is skipped and everything else works.
 
@@ -37,7 +37,7 @@ The short way is `update.cmd`: on a machine with no checkout it fetches
 Chromium and runs every stage below. Step by step:
 
 ```powershell
-cd C:\thorium
+cd D:\thorium
 .\build.ps1 sync                      # fetch Chromium, pin to current stable, gclient sync. HOURS.
 .\build.ps1 configure -Profile zen5   # apply the zen5 patch, write args.gn, gn gen. Minutes.
 .\verify-source.ps1 -Profile zen5     # the targeting reached the generated ninja. Seconds.
@@ -59,7 +59,9 @@ appears on the next deploy:
 `build.ps1 build -Target <ninja-target>` builds named targets only and
 writes no manifest. `root_store_tool` is about 2,500 steps and two minutes
 and still links base under ThinLTO, which is what the toolchain-bug matrices
-in `docs/TOOLCHAIN-BUGS.md` were bisected with.
+in `docs/TOOLCHAIN-BUGS.md` were bisected with. `build.ps1 canary` uses it to
+re-test the toolchain workarounds in a separate out dir, so the real build is
+not invalidated.
 
 ## The baseline profile
 
@@ -67,7 +69,7 @@ in `docs/TOOLCHAIN-BUGS.md` were bisected with.
 .\build.ps1 configure -Profile baseline
 .\build.ps1 build -Profile baseline
 .\build.ps1 analyze -Profile baseline
-python scripts\compare_builds.py --repo-root C:\thorium --profiles baseline zen5
+python scripts\compare_builds.py --repo-root D:\thorium --profiles baseline zen5
 ```
 
 Stock Chromium with the same shared args, in its own `out\thorium-baseline`.

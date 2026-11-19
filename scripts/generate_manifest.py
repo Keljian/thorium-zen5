@@ -8,7 +8,7 @@ change) differ there and nowhere else, and the deploy check compares it with
 the installed chrome.dll.
 
 Usage:
-    python scripts/generate_manifest.py --repo-root C:\\thorium --profile zen5
+    python scripts/generate_manifest.py --repo-root D:\\thorium --profile zen5
 """
 import argparse
 import datetime
@@ -46,7 +46,7 @@ def sha256(path: Path):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--repo-root", default=r"C:\thorium")
+    ap.add_argument("--repo-root", default=r"D:\thorium")
     ap.add_argument("--profile", required=True)
     args = ap.parse_args()
 

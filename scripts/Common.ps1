@@ -215,10 +215,14 @@ function Set-UpdateShortcut {
             Remove-Item -LiteralPath $o.FullName -Force -ErrorAction SilentlyContinue
         }
     }
-    if (-not $keep) {
-        $sc = $shell.CreateShortcut($target)
+    # Create it if missing, and repoint it if the repo has moved: an icon that
+    # still names the old folder (C:\thorium after the 2026-11-16 move to D:)
+    # opens a window that fails at once.
+    $iconArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $ThoriumRoot 'scripts\Check-ThoriumUpdate.ps1')`" -Interactive"
+    $sc = $shell.CreateShortcut($target)
+    if (-not $keep -or $sc.Arguments -ne $iconArgs -or $sc.WorkingDirectory -ne $ThoriumRoot) {
         $sc.TargetPath       = Join-Path $PSHOME "powershell.exe"
-        $sc.Arguments        = "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $ThoriumRoot 'scripts\Check-ThoriumUpdate.ps1')`" -Interactive"
+        $sc.Arguments        = $iconArgs
         $sc.WorkingDirectory = $ThoriumRoot
         $sc.IconLocation     = "$env:SystemRoot\System32\imageres.dll,229"
         $sc.Description      = "Install the newest Zen 5 Chromium build"

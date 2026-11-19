@@ -13,9 +13,17 @@
 # Backward CPU compatibility is explicitly NOT a goal: a binary built this
 # way will fault with an illegal instruction on any pre-Zen5 machine.
 #
-# ZEN 5 SCHEDULING IS ON, VIA A TAIL-MERGE WORKAROUND
-# ---------------------------------------------------
-# -mtune=znver4/znver5 MISCOMPILES under ThinLTO on this toolchain, producing
+# ZEN 5 SCHEDULING IS ON; THE TAIL-MERGE WORKAROUND IS RETIRED
+# ------------------------------------------------------------
+# Retired 2026-11-19 on clang llvmorg-24-init-17044-gc3223914 (Chromium
+# 159.0.8154.13): `.\build.ps1 canary` linked root_store_tool cleanly without
+# it, cold ThinLTO cache. The history below is kept for when a later roll
+# brings it back: the signature is a hard link error, and the fix is to put
+#   "-mllvm:-enable-tail-merge=false",
+# back at the top of zen5_extra_target_ldflags.
+#
+# -mtune=znver4/znver5 MISCOMPILED under ThinLTO on clang up to at least
+# llvmorg-24-init-7747-g62397f8b, producing
 #     lld-link: error: <unknown>:0: Missing .seh_endepilogue in <fn>
 # plus ~20 symbols dropped through whole-program-devirtualization branch
 # funnels. It is a SCHEDULER-triggered bug, not an ISA one: holding the
@@ -47,9 +55,9 @@
 #     disabling either would trade away more performance than the Zen 5
 #     scheduling model we are buying back.
 #
-# So we keep the full Zen 5 ISA *and* the Zen 5 scheduling model, and pay in
-# binary size only. Drop the ldflag and this reverts to a hard link error --
-# never a silent miscompile.
+# So we kept the full Zen 5 ISA *and* the Zen 5 scheduling model, and paid in
+# binary size only. On an affected clang, dropping the ldflag is a hard link
+# error -- never a silent miscompile.
 #
 # CAVEAT, recorded honestly: the in-directory control run for this specific
 # comparison was invalidated (its build was interrupted mid-flight and exited
@@ -57,9 +65,9 @@
 # from three earlier matrices that all reproduced -mtune=znver5 failing, not
 # from a same-run A/B. Re-run it if you want a clean control.
 #
-# Upstream status: still reproduces on a trunk clang roll ~4,000 commits newer
-# (llvmorg-24-init-7747-g62397f8b), so do not expect this to age out soon.
-# Our findings are attached to the upstream issue.
+# Upstream status: still reproduced on llvmorg-24-init-7747-g62397f8b; gone on
+# llvmorg-24-init-17044-gc3223914 (see the top of this block). Our findings are
+# attached to the upstream issue.
 
 # ThinLTO backend knobs, appended after Chromium's own values.
 #
@@ -84,7 +92,6 @@
 # changing these, delete out/thorium-zen5/thinlto-cache or the link silently
 # reuses the previous codegen and the A/B measures nothing.
 zen5_extra_target_ldflags = [
-  "-mllvm:-enable-tail-merge=false",
   "-mllvm:-import-instr-limit=100",
   "/opt:lldlto=3",
 ]
@@ -125,8 +132,14 @@ use_generic_avx512 = false
 zen5_march = "znver5"
 zen5_mtune = "znver5"
 
-# SLP VECTORIZER CAPPED AT 256 BITS
-# ---------------------------------
+# SLP VECTORIZER CAP, RETIRED
+# ---------------------------
+# Retired 2026-11-19 on clang llvmorg-24-init-17044-gc3223914: the one-file
+# probe in `.\build.ps1 canary` compiles SkPathRawShapes.cpp uncapped, with
+# 512-bit SLP code in it (11 zmm lines against 2 capped), and root_store_tool
+# links without the cap. If a later roll brings the abort back, set
+# zen5_slp_max_reg_size = "256" again.
+#
 # A THIRD toolchain bug, and this one is not AMD-specific: clang 24's X86
 # backend cannot select `v4i64 = zero_extend_vector_inreg` when 512-bit
 # vectors are enabled, and aborts instruction selection:
@@ -165,9 +178,9 @@ zen5_mtune = "znver5"
 # changing this, delete out/thorium-zen5/thinlto-cache or the link will
 # silently reuse the old codegen and appear unchanged.
 #
-# Set to "" once LLVM fixes the ISel gap. The failure is a hard link error.
+# "" means no cap. The failure, on an affected clang, is a hard link error.
 
-zen5_slp_max_reg_size = "256"
+zen5_slp_max_reg_size = ""
 
 # WASM REVECTORIZATION ON BY DEFAULT
 # ----------------------------------

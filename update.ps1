@@ -157,7 +157,7 @@ function Test-ClangRoll {
     $prevClang = if (Test-Path $clangFile) { (Get-Content $clangFile -Raw).Trim() } else { $null }
     if ($prevClang -and $prevClang -ne $cur) {
         Log ("clang rolled $prevClang -> $cur. Re-test the workarounds in gn/win_zen5_args.gn (zen5_slp_max_reg_size, " +
-             "the tail-merge ldflag) with the root_store_tool canary; delete thinlto-cache first. See docs/TOOLCHAIN-BUGS.md.") "WARN"
+             "the tail-merge ldflag): .\build.ps1 canary. See docs/TOOLCHAIN-BUGS.md.") "WARN"
     }
     Set-Content -Path $clangFile -Value $cur
 }
