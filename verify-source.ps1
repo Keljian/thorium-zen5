@@ -160,6 +160,24 @@ if (-not (Test-Path $tn)) {
                     Add-Warn "'$($w[1])' is on the chrome.dll link line but args.gn does not ask for it."
                 }
             }
+            # zen5_thinlto_max_ldflags exists to override Chromium's own values,
+            # so each must be the LAST of its kind on the line. Until
+            # 2026-11-19 these knobs came first and were silently overridden.
+            $knobs = @()
+            if ($argsText -match '(?s)zen5_thinlto_max_ldflags\s*=\s*\[([^\]]*)\]') {
+                $knobs = @([regex]::Matches($Matches[1], '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+            }
+            $tokens = @(($ld -replace '\$:', ':') -split '\s+' | Where-Object { $_ })
+            $knobsOk = $true
+            foreach ($k in $knobs) {
+                $key = if ($k.Contains("=")) { $k.Substring(0, $k.LastIndexOf("=") + 1) } else { $k }
+                $last = @($tokens | Where-Object { $_.StartsWith($key) }) | Select-Object -Last 1
+                if ($last -ne $k) {
+                    $knobsOk = $false
+                    Add-Err "zen5_thinlto_max_ldflags '$k' is not in effect on the chrome.dll link: the last '$key' there is '$last'."
+                }
+            }
+            $result.emitted_flags["thinlto_max_knobs"] = $knobsOk
         }
     } elseif ($text -match '-march=znver') {
         Add-Err "baseline toolchain.ninja contains -march=znver*; it is not a stock build."

@@ -236,8 +236,10 @@ every install (version, and chrome.dll hash where the release records one).
   to be a no-op and is off (`zen5_lto_backend_march = false`). See
   `docs/TOOLCHAIN-BUGS.md` and `patches/zen5/README.md`.
 - The shipped binary carries two LTO knobs that are **unmeasured**:
-  `-mllvm:-import-instr-limit=100` and `/opt:lldlto=3`. Plausible wins, not
-  established ones.
+  `-mllvm:-import-instr-limit=100` and `/opt:lldlto=3` on the chrome.dll and
+  chrome.exe links. Plausible wins, not established ones. Builds before
+  2026-11-19 did not actually get them: they sat ahead of Chromium's own
+  `=30` and `=2` on the link line, and the last value wins.
 - PGO uses Google's official generic win64 profile, not a Zen5-trained one.
   See `docs/BUILD.md` "About PGO".
 - No Google API keys are baked in, by choice, so Sync and the Safe Browsing

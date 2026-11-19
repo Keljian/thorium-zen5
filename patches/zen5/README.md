@@ -19,9 +19,11 @@ So there is no upstream flag to flip and nothing to override. We add our own.
 > Chromium 138 against a stable of 154, and all its release tags pointed at a
 > single May 8 commit. See `docs/ARCHITECTURE.md`.
 
-## The two edits
+## The edits
 
-Both land in `build/config/compiler/BUILD.gn`.
+Two land in `config("compiler")` of `build/config/compiler/BUILD.gn`; a
+third, marker-gated group adds the ThinLTO link knobs (below). The V8 groups
+are documented in the script.
 
 **1. `declare_args()`**, inserted immediately before `config("compiler")`,
 declaring `use_znver5`, `use_generic_avx512`, `zen5_march`, `zen5_mtune`,
@@ -36,6 +38,16 @@ honest.
 its flag-list initialisers (`cflags = []` ... `configs = []`). For x64
 Windows clang target builds it emits `-march`/`-mtune`, plus whichever of
 the toolchain workarounds are enabled.
+
+**3. ThinLTO link knobs**, a group with its own marker: a second
+`declare_args()` for `zen5_thinlto_max_ldflags` and
+`zen5_thinlto_default_ldflags`, appended at the END of
+`config("thinlto_optimize_max")` and `config("thinlto_optimize_default")`.
+Flags meant to override Chromium's own `/opt:lldlto=` and
+`-mllvm:-import-instr-limit=` have to come after them, and
+`zen5_extra_target_ldflags` in `config("compiler")` comes before both, so it
+cannot. lld takes the last `/opt:lldlto=` and LLVM's `cl::opt` the last
+occurrence; both checked on a two-function ThinLTO link with each order.
 
 The `is_a_target_toolchain` guard matters, with a caveat recorded in the
 script itself: on a non-cross Windows x64 build the host and target

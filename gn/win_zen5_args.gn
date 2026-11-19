@@ -69,14 +69,20 @@
 # llvmorg-24-init-17044-gc3223914 (see the top of this block). Our findings are
 # attached to the upstream issue.
 
-# ThinLTO backend knobs, appended after Chromium's own values.
+# ThinLTO link knobs, appended after Chromium's own values.
 #
-# Chromium already passes -mllvm:-import-instr-limit=30 and /opt:lldlto=2 on
-# every link. Both of ours come later on the command line and win: LLVM's
-# cl::opt takes the last occurrence and lld takes the last /opt:lldlto.
-# Verified against this checkout's own lld-link by passing each option twice --
-# both links exited 0 with no diagnostic, so these override rather than
-# conflict.
+# Chromium passes -mllvm:-import-instr-limit=30 and /opt:lldlto=2 on the
+# chrome.dll link. These come after them and win: lld takes the last
+# /opt:lldlto= and LLVM's cl::opt the last occurrence of an option.
+# verify-source.ps1 checks that each one is the last of its kind on the
+# chrome.dll link line.
+#
+# Until 2026-11-19 they were in zen5_extra_target_ldflags, which lands in
+# config("compiler"), AHEAD of Chromium's values, so both were overridden
+# and did nothing (seen on the 159.0.8154.13 chrome.dll link line; the patch
+# has always put that list there). The patch's zen5_thinlto_max_ldflags
+# appends at the end of config("thinlto_optimize_max"), so they apply to the
+# targets Chromium link-optimizes (chrome.dll, chrome.exe) and nothing else.
 #
 #   import-instr-limit=100  more cross-module inlining than Chromium's 30,
 #                           which is set for BUILD TIME on a fleet, not for
@@ -86,15 +92,20 @@
 #
 # UNMEASURED. Both are plausible wins and neither is established here; treat
 # the numbers in docs/BENCHMARKS.md as the authority once they exist. If they
-# do not pay, delete these two lines -- there is no other coupling.
+# do not pay, empty this list -- there is no other coupling.
 #
-# WARNING: -mllvm flags are NOT part of LLVM's ThinLTO cache key. After
-# changing these, delete out/thorium-zen5/thinlto-cache or the link silently
-# reuses the previous codegen and the A/B measures nothing.
-zen5_extra_target_ldflags = [
+# -mllvm flags are NOT part of LLVM's ThinLTO cache key; build.ps1 configure
+# clears thinlto-cache whenever args.gn changes, so an A/B is real.
+zen5_thinlto_max_ldflags = [
   "-mllvm:-import-instr-limit=100",
   "/opt:lldlto=3",
 ]
+
+# Extra ldflags for every CPU-targeted link. They land in config("compiler"),
+# ahead of Chromium's own flags, so only use this for flags Chromium does not
+# also set (the tail-merge workaround went here). Empty since the toolchain
+# workarounds were retired.
+zen5_extra_target_ldflags = []
 
 # The ThinLTO backend -march flag is a NO-OP. Measured, not assumed.
 #

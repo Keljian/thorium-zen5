@@ -699,7 +699,9 @@ function Invoke-Canary {
          which is where the tail-merge miscompile shows. Four variants of
          args.gn, in out\thorium-zen5-canary so the real build is untouched.
          Each clears the ThinLTO cache (-mllvm flags are not in its key) and
-         deletes the binary, so every variant really relinks.
+         deletes the binary, so every variant really relinks. It is linked
+         the way chrome.dll is: Chromium leaves it at /opt:lldlto=0, where
+         the backend runs no IR optimizer and so no vectorizer at all.
     Both bugs are hard compile or link errors, never silent, so PASS here plus
     a full chrome build that links is enough to retire a workaround.
     #>
@@ -727,6 +729,13 @@ function Invoke-Canary {
         $k = ([regex]::Matches($base, $pat)).Count
         if ($k -gt 1) { throw "args pattern $pat matches $k times; the canary cannot tell which to remove." }
     }
+    # Link like chrome.dll: Chromium's /opt:lldlto=2 for its optimized
+    # targets, then zen5_thinlto_max_ldflags on top, via the default-config
+    # hook the patch provides for exactly this.
+    if ($base -match '(?m)^\s*zen5_thinlto_default_ldflags\s*=') { throw "args.gn sets zen5_thinlto_default_ldflags; the canary sets it itself." }
+    $maxItems = if ($base -match '(?ms)^\s*zen5_thinlto_max_ldflags\s*=\s*\[([^\]]*)\]') { $Matches[1].Trim() } else { "" }
+    $base += "`n# build.ps1 canary: link root_store_tool the way chrome.dll is linked`n" +
+             "zen5_thinlto_default_ldflags = [ `"/opt:lldlto=2`", $maxItems ]`n"
     $variants = [ordered]@{
         "as-configured"      = $base
         "without-tail-merge" = $base -replace $tm, '$1'

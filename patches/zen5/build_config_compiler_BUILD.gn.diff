@@ -1,6 +1,6 @@
 --- a/build/config/compiler/BUILD.gn
 +++ b/build/config/compiler/BUILD.gn
-@@ -324,6 +324,136 @@
+@@ -330,6 +330,136 @@ config("no_unresolved_symbols") {
  # See also "runtime_library" below for related stuff and a discussion about
  # where stuff should go. Put warning related stuff in the "warnings" config.
  
@@ -137,11 +137,10 @@
  config("compiler") {
    asmflags = []
    cflags = []
-@@ -336,6 +466,96 @@
-   ldflags = []
+@@ -343,6 +473,96 @@ config("compiler") {
    defines = []
    configs = []
-+
+ 
 +  # --- thorium-zen5: Zen 5 CPU targeting ---
 +  # x64 Windows clang builds only.
 +  #
@@ -231,6 +230,52 @@
 +    }
 +  }
 +  # --- end thorium-zen5: Zen 5 CPU targeting ---
- 
++
    # System-specific flags. If your compiler flags apply to one of the
    # categories here, add it to the associated file to keep this shared config
+   # smaller.
+@@ -1280,6 +1500,20 @@ config("disallow_unstable_features") {
+   rustflags = [ "-Zallow-features=" ]
+ }
+ 
++# --- thorium-zen5: ThinLTO link knobs (declare_args) ---
++declare_args() {
++  # ldflags appended AFTER Chromium's own ThinLTO settings, so they
++  # override them (lld takes the last /opt:lldlto=, LLVM's cl::opt the
++  # last occurrence of an -mllvm option). Added by thorium-zen5; see
++  # scripts/apply_zen5_patches.py. Applied only when CPU targeting is on.
++  #
++  # max: the targets Chromium link-optimizes (chrome.dll, chrome.exe).
++  # default: everything else, which Chromium links at /opt:lldlto=0;
++  # build.ps1 canary uses it to link root_store_tool like chrome.dll.
++  zen5_thinlto_max_ldflags = []
++  zen5_thinlto_default_ldflags = []
++}
++
+ # The BUILDCONFIG file sets this config on targets by default, which means when
+ # building with ThinLTO, no optimization is performed in the link step.
+ config("thinlto_optimize_default") {
+@@ -1291,6 +1525,11 @@ config("thinlto_optimize_default") {
+     } else {
+       ldflags = [ "-Wl,--lto-O" + lto_opt_level ]
+     }
++    # --- thorium-zen5: ThinLTO link knobs ---
++    if (is_win && current_cpu == "x64" && is_clang &&
++        (use_znver5 || use_generic_avx512)) {
++      ldflags += zen5_thinlto_default_ldflags
++    }
+ 
+     if (toolchain_supports_rust_thin_lto) {
+       # We always point Rust to a linker that performs LTO, so we don't want
+@@ -1330,6 +1569,11 @@ config("thinlto_optimize_max") {
+     } else {
+       ldflags = [ "-Wl,--lto-O" + lto_opt_level ]
+     }
++    # --- thorium-zen5: ThinLTO link knobs ---
++    if (is_win && current_cpu == "x64" && is_clang &&
++        (use_znver5 || use_generic_avx512)) {
++      ldflags += zen5_thinlto_max_ldflags
++    }
+ 
+     if (toolchain_supports_rust_thin_lto) {
+       # We always point Rust to a linker that performs LTO, so we don't want

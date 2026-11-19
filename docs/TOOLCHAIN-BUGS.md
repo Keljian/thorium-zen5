@@ -19,6 +19,10 @@ things:
    without the tail-merge ldflag, without the SLP cap, without either. Each
    deletes the ThinLTO cache and the binary first, so every variant relinks
    with cold codegen. Failures are classified by the signatures below.
+   root_store_tool is linked the way chrome.dll is (`/opt:lldlto=2`, then
+   `zen5_thinlto_max_ldflags`), through `zen5_thinlto_default_ldflags`:
+   Chromium links it at `/opt:lldlto=0`, where the backend runs no IR
+   optimizer and so no vectorizer.
 
 Results go to `build\toolchain-canary.json` and `build\logs\canary.log`. A
 workaround that is not set makes its variant identical to the configured one,
@@ -31,6 +35,12 @@ links is the last word on the SLP cap.
 | date | clang | SLP probe, zmm capped / uncapped | as configured | no tail-merge | no SLP cap | neither |
 |---|---|---|---|---|---|---|
 | 2026-11-19 | llvmorg-24-init-17044-gc3223914 | FIXED, 2 / 11 | PASS | PASS | PASS | PASS |
+| 2026-11-19, linked like chrome.dll | llvmorg-24-init-17044-gc3223914 | FIXED, 2 / 11 | PASS | same | same | same |
+
+The first row linked root_store_tool at Chromium's `/opt:lldlto=0`, so its
+SLP-cap columns tested nothing; the tail-merge bug did reproduce at that
+level in the original matrices. The second row is the current method, run
+after both workarounds were retired, so every variant is the shipped config.
 
 ---
 

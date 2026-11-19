@@ -718,15 +718,92 @@ V8_AVX10_EDITS = [
     ),
 ]
 
-V8_GROUPS = [
+# ---------------------------------------------------------------------------
+# ThinLTO link knobs that actually override Chromium's.
+#
+# zen5_extra_target_ldflags lands in config("compiler"), which comes BEFORE
+# Chromium's own -mllvm:-import-instr-limit=30 (later in that same config)
+# and /opt:lldlto= (config("thinlto_optimize_*"), later still). lld takes the
+# last /opt:lldlto= and LLVM's cl::opt the last occurrence, so anything put
+# there to raise those values was silently overridden. Found 2026-11-19 on
+# the chrome.dll link line. These args append at the end of the two
+# thinlto_optimize configs instead, after Chromium's values.
+# ---------------------------------------------------------------------------
+LTO_MARKER = "thorium-zen5: ThinLTO link knobs"
+
+_LTO_DEFAULT_ANCHOR = (
+    "# The BUILDCONFIG file sets this config on targets by default, which means when\n"
+    "# building with ThinLTO, no optimization is performed in the link step.\n"
+    "config(\"thinlto_optimize_default\") {\n"
+)
+_LTO_SET_LEVEL = (
+    "    if (is_win) {\n"
+    "      ldflags = [ \"/opt:lldlto=\" + lto_opt_level ]\n"
+    "    } else {\n"
+    "      ldflags = [ \"-Wl,--lto-O\" + lto_opt_level ]\n"
+    "    }\n"
+)
+
+
+def _lto_append(arg: str) -> str:
+    return (
+        "    # --- " + LTO_MARKER + " ---\n"
+        "    if (is_win && current_cpu == \"x64\" && is_clang &&\n"
+        "        (use_znver5 || use_generic_avx512)) {\n"
+        "      ldflags += " + arg + "\n"
+        "    }\n"
+    )
+
+
+LTO_EDITS = [
+    (
+        "build/config/compiler/BUILD.gn",
+        [
+            (
+                "replace",
+                _LTO_DEFAULT_ANCHOR,
+                "# --- " + LTO_MARKER + " (declare_args) ---\n"
+                "declare_args() {\n"
+                "  # ldflags appended AFTER Chromium's own ThinLTO settings, so they\n"
+                "  # override them (lld takes the last /opt:lldlto=, LLVM's cl::opt the\n"
+                "  # last occurrence of an -mllvm option). Added by thorium-zen5; see\n"
+                "  # scripts/apply_zen5_patches.py. Applied only when CPU targeting is on.\n"
+                "  #\n"
+                "  # max: the targets Chromium link-optimizes (chrome.dll, chrome.exe).\n"
+                "  # default: everything else, which Chromium links at /opt:lldlto=0;\n"
+                "  # build.ps1 canary uses it to link root_store_tool like chrome.dll.\n"
+                "  zen5_thinlto_max_ldflags = []\n"
+                "  zen5_thinlto_default_ldflags = []\n"
+                "}\n"
+                "\n" + _LTO_DEFAULT_ANCHOR,
+            ),
+            (
+                "insert_after",
+                "    lto_opt_level = 0\n\n" + _LTO_SET_LEVEL,
+                _lto_append("zen5_thinlto_default_ldflags"),
+            ),
+            (
+                "insert_after",
+                "      lto_opt_level = 0\n    }\n\n" + _LTO_SET_LEVEL,
+                _lto_append("zen5_thinlto_max_ldflags"),
+            ),
+        ],
+    ),
+]
+
+# Marker-gated groups, applied after the targeting patch above. Each is
+# idempotent on its own marker, so a group added later still applies to a
+# tree the earlier patches already touched.
+EDIT_GROUPS = [
     (V8_MARKER, V8_EDITS, "V8 wasm_revectorize"),
     (V8_AVX10_MARKER, V8_AVX10_EDITS, "V8 AVX-512 as AVX10.1"),
+    (LTO_MARKER, LTO_EDITS, "ThinLTO link knobs"),
 ]
 
 
-def _apply_v8_group(src_dir: Path, marker: str, edits_by_file, label: str,
-                    dry_run: bool = False):
-    """Apply one group of V8 edits, identified by its marker.
+def _apply_group(src_dir: Path, marker: str, edits_by_file, label: str,
+                 dry_run: bool = False):
+    """Apply one group of edits, identified by its marker.
 
     All-or-nothing: every anchor in every file is checked before anything is
     written. Returns (changed_files, diffs). Exits 3 on a missing anchor or a
@@ -750,7 +827,7 @@ def _apply_v8_group(src_dir: Path, marker: str, edits_by_file, label: str,
                 print(
                     f"ERROR: {label} anchor matched {n} times (expected 1) in "
                     f"{rel}.\nAnchor was:\n{anchor!r}\n"
-                    "Upstream V8 changed shape. Nothing has been written.",
+                    "Upstream changed shape. Nothing has been written.",
                     file=sys.stderr,
                 )
                 sys.exit(3)
@@ -767,7 +844,7 @@ def _apply_v8_group(src_dir: Path, marker: str, edits_by_file, label: str,
     if marked and planned:
         print(
             f"ERROR: {label} patch is half-applied (marker present in some files, "
-            "absent in others). Restore the V8 files with git and re-run.",
+            "absent in others). Restore those files with git and re-run.",
             file=sys.stderr,
         )
         sys.exit(3)
@@ -790,12 +867,12 @@ def _apply_v8_group(src_dir: Path, marker: str, edits_by_file, label: str,
     return changed, diffs
 
 
-def apply_v8_edits(src_dir: Path, dry_run: bool = False):
-    """Every V8 edit group, in order. Groups may touch the same file; each is
+def apply_group_edits(src_dir: Path, dry_run: bool = False):
+    """Every edit group, in order. Groups may touch the same file; each is
     idempotent on its own marker."""
     changed, diffs = [], {}
-    for marker, edits_by_file, label in V8_GROUPS:
-        c, d = _apply_v8_group(src_dir, marker, edits_by_file, label, dry_run)
+    for marker, edits_by_file, label in EDIT_GROUPS:
+        c, d = _apply_group(src_dir, marker, edits_by_file, label, dry_run)
         changed += [p for p in c if p not in changed]
         for rel, diff in d.items():
             diffs[rel] = (diffs[rel] + "\n" + diff) if rel in diffs else diff
@@ -812,9 +889,12 @@ def main():
 
     src_dir = Path(args.src_dir)
     changed, diffs = apply_edits(src_dir, dry_run=args.dry_run)
-    v8_changed, v8_diffs = apply_v8_edits(src_dir, dry_run=args.dry_run)
-    changed += v8_changed
-    diffs.update(v8_diffs)
+    g_changed, g_diffs = apply_group_edits(src_dir, dry_run=args.dry_run)
+    changed += [p for p in g_changed if p not in changed]
+    # A group can patch a file the targeting patch also patched in this run;
+    # keep both diffs.
+    for rel, diff in g_diffs.items():
+        diffs[rel] = (diffs[rel] + "\n" + diff) if rel in diffs else diff
 
     if args.capture_diffs and args.patches_dir and diffs:
         pdir = Path(args.patches_dir)

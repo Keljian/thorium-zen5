@@ -181,3 +181,17 @@ Audit findings fixed and the scripts shrunk:
 - **configure clears the ThinLTO cache when args.gn changes.** `-mllvm`
   flags are not in its key, so retiring a workaround and relinking would
   have reused the old codegen and shipped an unchanged chrome.dll.
+- **The two LTO knobs never applied.** `-mllvm:-import-instr-limit=100` and
+  `/opt:lldlto=3` were in `zen5_extra_target_ldflags`, which the patch puts
+  in `config("compiler")`, ahead of Chromium's `-import-instr-limit=30`
+  (later in that config) and `/opt:lldlto=2` (`thinlto_optimize_max`). The
+  last value wins for both, checked on a small ThinLTO link with each order,
+  so chrome.dll was linked with Chromium's values. They now go in
+  `zen5_thinlto_max_ldflags`, appended at the end of `thinlto_optimize_max`,
+  and `verify-source.ps1` fails the build if any of them is not the last of
+  its kind on the chrome.dll link line.
+- **The canary was not linking like chrome.dll.** Chromium links everything
+  except its optimized targets at `/opt:lldlto=0`, where the ThinLTO backend
+  runs no IR optimizer, so root_store_tool never ran the SLP vectorizer and
+  its "without the SLP cap" result meant nothing. The canary now raises it to
+  chrome.dll's settings through `zen5_thinlto_default_ldflags`.
